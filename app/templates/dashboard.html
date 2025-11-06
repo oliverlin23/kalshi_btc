@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kalshi BTC Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header h1 {
+            font-size: 28px;
+            color: #667eea;
+            font-weight: 700;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #10b981;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .timestamp {
+            color: #6b7280;
+            font-size: 14px;
+        }
+
+        .cards-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 16px;
+            border-bottom: 2px solid #f3f4f6;
+        }
+
+        .ticker {
+            font-size: 20px;
+            font-weight: 700;
+            color: #1f2937;
+            font-family: 'Courier New', monospace;
+        }
+
+        .status-badge {
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .status-ok {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .status-error {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .mid-block {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 16px;
+            padding: 16px;
+            background: linear-gradient(135deg, #eef2ff 0%, #e0e7ff 100%);
+            border-radius: 12px;
+            border: 1px solid #e5e7eb;
+        }
+
+        .mid-label {
+            font-size: 14px;
+            color: #6b7280;
+            font-weight: 600;
+            letter-spacing: .03em;
+            text-transform: uppercase;
+        }
+
+        .mid-value {
+            font-size: 32px;
+            font-weight: 800;
+            color: #1d4ed8;
+            font-family: 'Courier New', monospace;
+        }
+
+        .price-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            padding: 12px;
+            background: #f9fafb;
+            border-radius: 8px;
+        }
+
+        .price-label {
+            font-size: 14px;
+            color: #6b7280;
+            font-weight: 500;
+        }
+
+        .price-value {
+            font-size: 24px;
+            font-weight: 700;
+            font-family: 'Courier New', monospace;
+        }
+
+        .price-buy {
+            color: #059669;
+        }
+
+        .price-sell {
+            color: #dc2626;
+        }
+
+        .price-mid { color: #2563eb; }
+
+        .error-message {
+            color: #dc2626;
+            font-size: 14px;
+            margin-top: 12px;
+            padding: 12px;
+            background: #fef2f2;
+            border-radius: 8px;
+            border-left: 4px solid #dc2626;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: white;
+            font-size: 18px;
+        }
+
+        .refresh-info {
+            background: white;
+            border-radius: 12px;
+            padding: 16px;
+            text-align: center;
+            color: #6b7280;
+            font-size: 14px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+
+        <div id="dashboard-content">
+            <div class="loading">Loading prices...</div>
+        </div>
+
+        
+    </div>
+
+    <script>
+        const REFRESH_INTERVAL = 500; // 0.5 seconds
+
+        function formatSig3(price) {
+            if (price === null || price === undefined) return '-';
+            const n = Number(price);
+            if (!isFinite(n)) return '-';
+            // Convert decimal dollars (0-1) to cents (0-100)
+            const cents = n * 100;
+            return cents.toPrecision(3);
+        }
+
+        function renderDashboard(data) {
+            const container = document.getElementById('dashboard-content');
+            
+            if (!data) {
+                container.innerHTML = '<div class="loading">Error loading data</div>';
+                return;
+            }
+
+            if (data.error && (!data.prices || data.prices.length === 0)) {
+                container.innerHTML = `<div class="loading">${data.error || 'No markets found'}</div>`;
+                return;
+            }
+
+            if (!data.prices || data.prices.length === 0) {
+                container.innerHTML = '<div class="loading">No markets found. Set BTC_CURRENT_PRICE environment variable.</div>';
+                return;
+            }
+
+            let html = '<div class="cards-grid">';
+            
+            data.prices.forEach(price => {
+                let statusClass, statusText;
+                if (price.status === 'ok') {
+                    statusClass = 'status-ok';
+                    statusText = 'Live';
+                } else if (price.status === 'not_found') {
+                    statusClass = 'status-error';
+                    statusText = 'Not Found';
+                } else {
+                    statusClass = 'status-error';
+                    statusText = 'Error';
+                }
+                
+                html += `
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="ticker">${price.ticker}</span>
+                            <span class="status-badge ${statusClass}">${statusText}</span>
+                        </div>
+                `;
+
+                if (price.status === 'ok') {
+                    // Build concise market descriptor
+                    let descriptor = '-';
+                    if (price.market_type === 'range' && typeof price.market_value === 'number') {
+                        const lower = Math.round(price.market_value - 125);
+                        const upper = Math.round(price.market_value + 125);
+                        descriptor = `${lower.toLocaleString()}–${upper.toLocaleString()}`;
+                    } else if (price.market_type === 'threshold' && typeof price.market_value === 'number') {
+                        const rounded = Math.round(price.market_value);
+                        descriptor = `above ${rounded.toLocaleString()}`;
+                    }
+
+                    html += `
+                        <div style="margin-bottom: 12px; padding: 8px; background: #f3f4f6; border-radius: 6px; font-size: 12px; color: #6b7280;">
+                            ${descriptor}
+                        </div>
+                        <div class="mid-block">
+                            <span class="mid-label">Mid</span>
+                            <span class="mid-value">${formatSig3(price.mid_price)}</span>
+                        </div>
+                        <div class="price-row">
+                            <span class="price-label">Buy (Ask)</span>
+                            <span class="price-value price-buy">${formatSig3(price.buy_price)} x ${(price.buy_volume ?? '-')}</span>
+                        </div>
+                        <div class="price-row">
+                            <span class="price-label">Sell (Bid)</span>
+                            <span class="price-value price-sell">${formatSig3(price.sell_price)} x ${(price.sell_volume ?? '-')}</span>
+                        </div>
+                    `;
+                } else {
+                    const errorType = price.status === 'not_found' ? 'Market Not Found' : 'Error';
+                    html += `
+                        <div style="margin-bottom: 12px; padding: 8px; background: #f3f4f6; border-radius: 6px; font-size: 12px; color: #6b7280;">
+                            ${price.market_type ? (price.market_type.charAt(0).toUpperCase() + price.market_type.slice(1)) : ''}: ${price.market_value ? price.market_value.toLocaleString() : '-'}
+                        </div>
+                        <div class="error-message">
+                            <strong>${errorType}:</strong> ${price.error || 'Unknown error'}
+                        </div>
+                    `;
+                }
+
+                html += '</div>';
+            });
+
+            html += '</div>';
+            container.innerHTML = html;
+        }
+
+        async function fetchPrices() {
+            try {
+                const response = await fetch('/api/prices');
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({ error: `HTTP ${response.status}: ${response.statusText}` }));
+                    document.getElementById('dashboard-content').innerHTML = 
+                        `<div class="loading" style="color: #dc2626;">Error: ${errorData.error || 'Failed to load prices'}</div>`;
+                    return;
+                }
+                const data = await response.json();
+                renderDashboard(data);
+            } catch (error) {
+                console.error('Error fetching prices:', error);
+                const container = document.getElementById('dashboard-content');
+                if (container) {
+                    container.innerHTML = 
+                        '<div class="loading" style="color: #dc2626;">Error loading prices. Check console for details.</div>';
+                }
+            }
+        }
+
+        // Initial load
+        fetchPrices();
+
+        // Auto-refresh
+        setInterval(fetchPrices, REFRESH_INTERVAL);
+    </script>
+</body>
+</html>
+
