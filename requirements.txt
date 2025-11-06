@@ -12,3 +12,7 @@ scipy>=1.11.0
 flask>=3.0.0
 pytz>=2023.3
 
+# Twitter sentiment analysis
+matplotlib>=3.7.0
+pandas>=2.0.0
+tweepy>=4.16.0
