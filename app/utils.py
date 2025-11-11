@@ -89,6 +89,36 @@ def get_kalshi_price_by_ticker(ticker, action="buy"):
         raise ValueError(f"Error fetching Kalshi price: {e}")
 
 
+def get_kalshi_mid_price_by_ticker(ticker):
+    """
+    Get the mid-price (average of bid and ask) for a market.
+
+    Args:
+        ticker: Market ticker (e.g., "BTC-UP-20241231")
+
+    Returns:
+        The mid-price in decimal format (0-1), average of bid and ask.
+
+    Raises:
+        ValueError: If bid/ask prices are unavailable
+    """
+    try:
+        client = get_kalshi_client()
+        market = client.get_market(ticker=ticker)
+
+        if market.market.yes_bid is not None and market.market.yes_ask is not None:
+            mid_price = ((market.market.yes_bid + market.market.yes_ask) / 2) / 100
+            return mid_price
+        elif market.market.last_price:
+            return market.market.last_price / 100
+        else:
+            raise ValueError(f"Error: No bid/ask prices available for market {ticker}")
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Error fetching mid price: {e}")
+
+
 def get_kalshi_spread_by_ticker(ticker):
     """
     Get the bid-ask spread for a market.

@@ -42,11 +42,19 @@ except ImportError:
     print("ERROR: predict_price_probability module not available. Cannot trade without predictions.")
     sys.exit(1)
 
+# Import Merton parameter estimation for jump-diffusion interpolation
+try:
+    from monte_carlo_btc import estimate_merton_params
+except ImportError:
+    print("WARNING: monte_carlo_btc module not available. Interpolation will use simpler method.")
+    estimate_merton_params = None
+
 # Tunable global variables
-BASE_SPREAD_CENTS = 8  # Base spread in cents (minimum spread)
-VOLATILITY_MULTIPLIER = 2500  # Multiplier to convert volatility to spread (tune this)
+BASE_SPREAD_CENTS = 5  # Base spread in cents (minimum spread)
+VOLATILITY_MULTIPLIER = 10000  # Multiplier to convert volatility to spread (tune this)
 MAX_SPREAD_CENTS = 50  # Maximum spread in cents (safety limit)
-VOLUME = 25  # Base number of contracts to trade per side (used as fallback)
+VOLUME = 10  # Base number of contracts to trade per side (used as fallback and fixed volume)
+USE_KELLY_SIZING = False  # If True, use Kelly criterion for position sizing; if False, use fixed VOLUME
 MAX_POSITION_PCT_OF_BALANCE = 0.20  # Maximum position size as % of available balance (20%)
 KELLY_FRACTION = 0.25  # Fraction of Kelly criterion to use (25% = quarter Kelly, more conservative)
 MIN_POSITION_SIZE = 5  # Minimum contracts to trade (for small balances)
@@ -78,6 +86,11 @@ price_data_initialized = False
 last_price_update_time = 0.0  # Track when we last updated the price queue
 price_queue_lock = threading.Lock()  # Lock for thread-safe queue access
 price_queue_thread = None  # Background thread for queue updates
+
+# 1-minute price queue - updated every second during trading cycles
+# Used for high-frequency Merton parameter estimation
+one_minute_price_queue = deque(maxlen=60)  # 60 seconds of data
+one_minute_queue_lock = threading.Lock()  # Lock for thread-safe queue access
 
 # Cache for price data arrays (numpy arrays for efficiency)
 _price_data_cache = {
@@ -313,6 +326,15 @@ def predict_market_resolution_probability(ticker: str, current_price_override: O
             print(f"  Warning: Invalid current price: {S0}")
             return None
         
+        # Get 1-minute queue data for high-frequency Merton parameter estimation
+        one_minute_prices = None
+        one_minute_last_ts = None
+        with one_minute_queue_lock:
+            if len(one_minute_price_queue) >= 30:  # Need at least 30 points for estimation
+                one_minute_queue_items = list(one_minute_price_queue)
+                one_minute_prices = np.array([price for _, price in one_minute_queue_items], dtype=np.float64)
+                one_minute_last_ts = one_minute_queue_items[-1][0] if one_minute_queue_items else None
+        
         # Threshold market: Predict P(BTC > threshold)
         target_price = threshold_info.threshold
         prob_above = predict_price_probability(
@@ -320,13 +342,16 @@ def predict_market_resolution_probability(ticker: str, current_price_override: O
             target_price=target_price,
             hours_ahead=hours_until_resolution,
             model=PREDICTION_MODEL,
+            weight_5m=0.4,  # Use default weights (can be made configurable)
             weight_15m=PREDICTION_WEIGHT_15M,
             weight_1h=PREDICTION_WEIGHT_1H,
             weight_6h=PREDICTION_WEIGHT_6H,
             prices_data=prices,
             last_timestamp=last_ts,
             current_price=S0,  # Use fresh current price if provided
-            data_step_seconds=DATA_STEP_SECONDS
+            data_step_seconds=DATA_STEP_SECONDS,
+            one_minute_prices_data=one_minute_prices,  # Pass 1-minute queue data
+            one_minute_last_timestamp=one_minute_last_ts
         )
         predicted_prob = prob_above['probability_above']
         volatility = prob_above['parameters']['sigma_dt']  # per-minute volatility
@@ -651,7 +676,10 @@ def calculate_optimal_position_size(
     volatility: Optional[float] = None
 ) -> int:
     """
-    Calculate optimal position size using Kelly criterion with risk limits.
+    Calculate optimal position size using Kelly criterion with risk limits, or fixed volume.
+    
+    If USE_KELLY_SIZING is False, returns fixed VOLUME.
+    If USE_KELLY_SIZING is True, uses Kelly criterion:
     
     Kelly formula: f* = (p * b - q) / b
     where:
@@ -672,6 +700,10 @@ def calculate_optimal_position_size(
     Returns:
         Optimal number of contracts to trade
     """
+    # If Kelly sizing is disabled, return fixed volume
+    if not USE_KELLY_SIZING:
+        return VOLUME
+    
     # Fallback to base volume if we can't calculate optimal size
     if market_price is None:
         return VOLUME
@@ -881,31 +913,16 @@ def initialize_price_queue_from_bitstamp():
         _price_data_cache['prices_array'] = None
         
         # If we want per-second or per-5-second data, we need to interpolate from 1-minute data
-        # Use volatility-preserving interpolation to maintain reasonable parameters on cold start
+        # Use time-varying volatility and Merton jump-diffusion interpolation
         if DATA_STEP_SECONDS < 60:
-            # First, estimate volatility from 1-minute data to guide interpolation
-            if len(ohlc_data) >= 2:
-                # Extract prices as numpy array for efficient calculation
-                prices_array = np.array([price for _, price in ohlc_data[:100]], dtype=np.float64)  # Use up to 100 points
-                
-                if len(prices_array) >= 2:
-                    # Calculate log returns using numpy (more efficient)
-                    log_returns = np.diff(np.log(prices_array))
-                    
-                    # Estimate per-minute volatility using numpy std (sample std, ddof=1)
-                    if len(log_returns) >= 2:
-                        minute_volatility = log_returns.std(ddof=1)
-                        # Scale to per-interval volatility (for DATA_STEP_SECONDS)
-                        interval_volatility = minute_volatility * np.sqrt(DATA_STEP_SECONDS / 60.0)
-                    else:
-                        # Fallback: use a reasonable default volatility
-                        interval_volatility = 0.001 * np.sqrt(DATA_STEP_SECONDS / 60.0)  # ~0.1% per minute
-                else:
-                    interval_volatility = 0.001 * np.sqrt(DATA_STEP_SECONDS / 60.0)
-            else:
-                interval_volatility = 0.001 * np.sqrt(DATA_STEP_SECONDS / 60.0)
+            # Configuration for time-varying parameter estimation
+            ROLLING_WINDOW_MINUTES = 30  # Use last 30 minutes for parameter estimation
+            MIN_POINTS_FOR_ESTIMATION = 10  # Minimum points needed for reliable estimation
             
-            # For finer granularity, interpolate from 1-minute data using Brownian bridge
+            # Convert prices to numpy array for efficient processing
+            prices_array = np.array([price for _, price in ohlc_data], dtype=np.float64)
+            
+            # For finer granularity, interpolate from 1-minute data using Brownian bridge with jumps
             # Each minute has 60 seconds, so we'll create DATA_STEP_SECONDS intervals per minute
             points_per_minute = 60 // DATA_STEP_SECONDS
             
@@ -913,20 +930,75 @@ def initialize_price_queue_from_bitstamp():
                 # Add the minute data point
                 price_data_queue.append((ts, price))
                 
-                # If not the last point, interpolate intermediate points using Brownian bridge
+                # If not the last point, interpolate intermediate points using time-varying parameters
                 if i < len(ohlc_data) - 1:
                     next_ts, next_price = ohlc_data[i + 1]
                     time_diff = next_ts - ts
                     price_diff = next_price - price
                     
-                    # Use Brownian bridge interpolation to preserve volatility
-                    # This creates a random walk between endpoints that preserves variance
-                    # Brownian bridge variance at time t: sigma^2 * t * (1 - t)
+                    # Estimate time-varying parameters using rolling window
+                    # Use data up to current point (i+1) with exponential weighting for recent data
+                    window_start_idx = max(0, i + 1 - ROLLING_WINDOW_MINUTES)
+                    window_prices = prices_array[window_start_idx:i+2]  # Include current and next point
+                    
+                    # Estimate parameters for this window
+                    if len(window_prices) >= MIN_POINTS_FOR_ESTIMATION and estimate_merton_params is not None:
+                        try:
+                            # Estimate Merton jump-diffusion parameters from rolling window
+                            merton_params = estimate_merton_params(
+                                window_prices,
+                                risk_neutral=True,
+                                drift_factor=0.0,
+                                time_period_seconds=60  # 1-minute intervals
+                            )
+                            mu_dt = merton_params['mu_dt']  # Drift per minute
+                            sigma_dt = merton_params['sigma_dt']
+                            lam = merton_params['lam']  # Jump intensity per minute
+                            mu_J = merton_params['mu_J']  # Mean jump size
+                            delta = merton_params['delta']  # Jump size std dev
+                        except Exception as e:
+                            # Fallback to simple volatility estimation if Merton fails
+                            if len(window_prices) >= 2:
+                                log_returns_window = np.diff(np.log(window_prices))
+                                sigma_dt = log_returns_window.std(ddof=1) if len(log_returns_window) >= 2 else 0.001
+                            else:
+                                sigma_dt = 0.001
+                            mu_dt = 0.0
+                            lam = 0.0
+                            mu_J = 0.0
+                            delta = 0.001
+                    else:
+                        # Fallback: use simple volatility estimation
+                        if len(window_prices) >= 2:
+                            log_returns_window = np.diff(np.log(window_prices))
+                            sigma_dt = log_returns_window.std(ddof=1) if len(log_returns_window) >= 2 else 0.001
+                            mu_dt = log_returns_window.mean() if len(log_returns_window) >= 1 else 0.0
+                        else:
+                            sigma_dt = 0.001
+                            mu_dt = 0.0
+                        lam = 0.0
+                        mu_J = 0.0
+                        delta = 0.001
+                    
+                    # Scale parameters to per-interval (DATA_STEP_SECONDS) from per-minute
+                    interval_volatility = sigma_dt * np.sqrt(DATA_STEP_SECONDS / 60.0)
+                    interval_drift = mu_dt * (DATA_STEP_SECONDS / 60.0)  # Drift per interval
+                    interval_jump_intensity = lam * (DATA_STEP_SECONDS / 60.0)  # Expected jumps per interval
+                    
+                    # Calculate jump compensator (ensures process is correctly centered)
+                    # kappa = E[exp(J) - 1] = exp(mu_J + 0.5*delta^2) - 1
+                    kappa = math.exp(mu_J + 0.5 * delta**2) - 1.0
+                    interval_compensator = lam * kappa * (DATA_STEP_SECONDS / 60.0)  # Compensator per interval
+                    
+                    # Use Brownian bridge interpolation with jump-diffusion
+                    # This creates a random walk between endpoints that preserves variance and includes jumps
                     num_intervals = points_per_minute - 1
                     if num_intervals > 0:
                         # Generate deviations from linear interpolation with proper variance
                         # The variance of a Brownian bridge at time t is sigma^2 * t * (1 - t)
                         bridge_deviations = []
+                        jump_deviations = []
+                        
                         for j in range(1, num_intervals + 1):
                             t = j / points_per_minute
                             
@@ -935,6 +1007,7 @@ def initialize_price_queue_from_bitstamp():
                             variance_bridge = interval_volatility**2 * t * (1 - t)
                             std_bridge = math.sqrt(max(0, variance_bridge))
                             
+                            # Diffusion component (Brownian bridge)
                             if j < num_intervals:
                                 # Generate deviation from linear interpolation
                                 deviation = random.gauss(0, std_bridge)
@@ -942,24 +1015,59 @@ def initialize_price_queue_from_bitstamp():
                             else:
                                 # Last point: ensure bridge ends at next_price (sum of deviations = 0)
                                 bridge_deviations.append(-sum(bridge_deviations))
+                            
+                            # Jump component: simulate jumps based on jump intensity using Poisson process
+                            # interval_jump_intensity is the expected number of jumps per interval (lambda)
+                            # Sample number of jumps from Poisson distribution
+                            num_jumps = np.random.poisson(interval_jump_intensity) if interval_jump_intensity > 0 else 0
+                            
+                            if num_jumps > 0:
+                                # Sample jump sizes from Normal(mu_J, delta) distribution
+                                # Sum of jumps is Normal(num_jumps * mu_J, sqrt(num_jumps) * delta)
+                                total_jump_size = random.gauss(num_jumps * mu_J, delta * math.sqrt(max(1, num_jumps)))
+                                jump_deviations.append(total_jump_size)
+                            else:
+                                jump_deviations.append(0.0)
                         
                         # Build cumulative bridge path (deviations from linear interpolation)
                         bridge_path = [0.0]  # Start at 0 (no deviation at start)
                         for dev in bridge_deviations:
                             bridge_path.append(bridge_path[-1] + dev)
                         
+                        # Build cumulative jump path
+                        jump_path = [0.0]
+                        for jump_dev in jump_deviations:
+                            jump_path.append(jump_path[-1] + jump_dev)
+                        
                         # Add interpolated points
                         for j in range(1, points_per_minute):
                             interp_ts = ts + (j * DATA_STEP_SECONDS)
                             if interp_ts < next_ts:
-                                # Linear interpolation component
+                                # Work in log-space for proper combination of diffusion and jumps
                                 t = j / points_per_minute
-                                linear_component = price + t * price_diff
                                 
-                                # Bridge deviation component (preserves volatility)
+                                # Linear interpolation in log-space (captures observed drift between endpoints)
+                                log_price = math.log(price)
+                                log_next_price = math.log(next_price)
+                                log_linear_component = log_price + t * (log_next_price - log_price)
+                                
+                                # Bridge deviation component (preserves volatility, already in log-space)
                                 bridge_component = bridge_path[j] if j < len(bridge_path) else 0.0
                                 
-                                interp_price = linear_component + bridge_component
+                                # Jump component (adds jump-diffusion dynamics, already in log-space)
+                                jump_component = jump_path[j] if j < len(jump_path) else 0.0
+                                
+                                # Drift component: incorporate estimated drift (adjusted for compensator)
+                                # The linear interpolation already captures total observed drift, so we add
+                                # the difference between estimated drift and what's already in linear interpolation
+                                # For small intervals, this ensures the process follows Merton dynamics
+                                drift_component = (interval_drift - 0.5 * interval_volatility**2 - interval_compensator) * t
+                                
+                                # Combine: linear + diffusion + jumps + drift adjustment (all in log-space)
+                                # Note: Linear interpolation already includes observed drift, so drift_component
+                                # adjusts for the difference between estimated and observed drift
+                                log_interp_price = log_linear_component + bridge_component + jump_component + drift_component
+                                interp_price = math.exp(log_interp_price)
                                 
                                 # Ensure price stays reasonable (within 1% bounds)
                                 min_price = min(price, next_price) * 0.99
@@ -968,12 +1076,15 @@ def initialize_price_queue_from_bitstamp():
                                 
                                 price_data_queue.append((interp_ts, interp_price))
             
-            print(f"  Interpolated to {DATA_STEP_SECONDS}-second intervals using volatility-preserving method: {len(price_data_queue)} points")
+            print(f"  Interpolated to {DATA_STEP_SECONDS}-second intervals using time-varying volatility and Merton jump-diffusion: {len(price_data_queue)} points")
             
             # Fetch current price to add most recent point
             current_ticker = fetch_bitstamp_ticker()
             if current_ticker:
                 price_data_queue.append(current_ticker)
+                # Also initialize 1-minute queue with current price
+                with one_minute_queue_lock:
+                    one_minute_price_queue.append(current_ticker)
         else:
             # For per-minute data, use OHLC data directly
             for ts, price in ohlc_data:
@@ -1061,6 +1172,34 @@ def update_price_queue():
             return True
     
     return False
+
+
+def update_one_minute_queue():
+    """
+    Update the 1-minute price queue with current BTC price.
+    Called every second during trading cycles.
+    Thread-safe and adds current price with timestamp.
+    """
+    global one_minute_price_queue
+    
+    with one_minute_queue_lock:
+        # Fetch current BTC price
+        btc_price = None
+        for attempt in range(3):  # Try up to 3 times
+            try:
+                btc_price = get_current_btc_price_estimate()
+                if btc_price is not None:
+                    break
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(0.1)  # Brief delay before retry
+                else:
+                    # If we can't fetch, skip this update
+                    return
+        
+        if btc_price is not None:
+            current_time = time.time()
+            one_minute_price_queue.append((current_time, float(btc_price)))
 
 
 def price_queue_updater_thread():
@@ -1168,6 +1307,9 @@ def run_trading_cycle(cycle_num: int) -> bool:
     # Note: Price queue updates are now handled by background thread
     # No need to call update_price_queue() here anymore
     
+    # Update 1-minute price queue every second during trading cycles
+    update_one_minute_queue()
+    
     # Calculate PnL for markets that resolved in the previous hour (at start of new hour)
     calculate_pnl_for_resolved_markets()
     
@@ -1261,11 +1403,10 @@ def run_trading_cycle(cycle_num: int) -> bool:
         old_buy_limit_price = round_to_cent(last_order_details['buy_limit_price']) if last_order_details['buy_limit_price'] is not None else None
         old_sell_limit_price = round_to_cent(last_order_details['sell_limit_price']) if last_order_details['sell_limit_price'] is not None else None
         
-        # Check if rounded limit prices changed (this is what actually matters for Kalshi)
         buy_price_changed = (old_buy_limit_price != new_buy_limit_price)
         sell_price_changed = (old_sell_limit_price != new_sell_limit_price)
         
-        # Only update if rounded prices changed (don't care about raw prediction/spread if rounded prices are same)
+        # Only update if rounded prices changed
         if buy_price_changed or sell_price_changed:
             need_to_update = True
     
@@ -1283,9 +1424,9 @@ def run_trading_cycle(cycle_num: int) -> bool:
         
         # Calculate optimal position sizes based on edge and balance
         try:
-            from app.utils import get_available_funds, get_kalshi_price_by_ticker
+            from app.utils import get_available_funds, get_kalshi_mid_price_by_ticker
             available_balance = get_available_funds()
-            market_price = get_kalshi_price_by_ticker(ticker, action="buy")  # Use ask price as reference
+            market_price = get_kalshi_mid_price_by_ticker(ticker)  # Use mid-price (average of bid/ask)
         except Exception:
             available_balance = None
             market_price = None
@@ -1297,10 +1438,10 @@ def run_trading_cycle(cycle_num: int) -> bool:
             volatility=volatility
         )
         
-        # For sell side, use inverse probability
+        # For sell side, use inverse probability and same mid-price
         sell_position_size = calculate_optimal_position_size(
             predicted_prob=1.0 - predicted_prob,  # Inverse for sell side
-            market_price=1.0 - market_price if market_price else None,
+            market_price=market_price,  # Use same mid-price for sell side
             available_balance=available_balance,
             volatility=volatility
         )
@@ -1418,7 +1559,10 @@ def main():
     print("=" * 60)
     print(f"Dynamic Spread: {BASE_SPREAD_CENTS}-{MAX_SPREAD_CENTS} cents (based on volatility)")
     print(f"  Base: {BASE_SPREAD_CENTS}c, Multiplier: {VOLATILITY_MULTIPLIER}x volatility")
-    print(f"Volume: {VOLUME} contracts per side")
+    if USE_KELLY_SIZING:
+        print(f"Position Sizing: Kelly criterion ({KELLY_FRACTION*100:.0f}% Kelly, max {MAX_POSITION_PCT_OF_BALANCE*100:.0f}% of balance)")
+    else:
+        print(f"Position Sizing: Fixed volume ({VOLUME} contracts per side)")
     print(f"Interval: {CYCLE_INTERVAL_SECONDS}s")
     print(f"Prediction Model: {PREDICTION_MODEL}")
     print(f"Data Source: Bitstamp API (no CSV)")

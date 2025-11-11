@@ -178,17 +178,18 @@ def clear_parameter_cache():
 
 def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None, 
                              lookback_hours=24, model='merton',
-                             weight_15m=0.5, weight_1h=0.3, weight_6h=0.2,
+                             weight_5m=0.4, weight_15m=0.3, weight_1h=0.2, weight_6h=0.1,
                              verbose=False, prices_data=None, last_timestamp=None, current_price=None,
-                             data_step_seconds=60):
+                             data_step_seconds=60, one_minute_prices_data=None, one_minute_last_timestamp=None):
     """
     Predict probability of BTC price being above target_price in hours_ahead.
     Uses analytical methods only (instant results, no Monte Carlo).
     
     Parameters are estimated using weighted averages from multiple timeframes:
-    - Last 15 minutes (weight: configurable, default 50%)
-    - Last 1 hour (weight: configurable, default 30%)
-    - Last 6 hours (weight: configurable, default 20%)
+    - Last 5 minutes (weight: configurable, default 40%)
+    - Last 15 minutes (weight: configurable, default 30%)
+    - Last 1 hour (weight: configurable, default 20%)
+    - Last 6 hours (weight: configurable, default 10%)
     
     More recent data is weighted more heavily to capture current market conditions.
     
@@ -198,14 +199,17 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
         hours_ahead: Hours into the future
         lookback_hours: Hours of historical data to load (default: 24, must be >= 6)
         model: Model to use ('gbm' or 'merton')
-        weight_15m: Weight for 15-minute timeframe (default: 0.5)
-        weight_1h: Weight for 1-hour timeframe (default: 0.3)
-        weight_6h: Weight for 6-hour timeframe (default: 0.2)
+        weight_5m: Weight for 5-minute timeframe (default: 0.4)
+        weight_15m: Weight for 15-minute timeframe (default: 0.3)
+        weight_1h: Weight for 1-hour timeframe (default: 0.2)
+        weight_6h: Weight for 6-hour timeframe (default: 0.1)
         verbose: If True, print detailed output (default: False)
         prices_data: Optional array of prices (if provided, csv_path is ignored)
         last_timestamp: Optional last timestamp (required if prices_data provided)
         current_price: Optional current price (required if prices_data provided)
         data_step_seconds: Time interval between data points in seconds (default: 60 for 1-minute)
+        one_minute_prices_data: Optional array of prices from 1-minute queue (per-second updates)
+        one_minute_last_timestamp: Optional last timestamp for 1-minute queue
     
     Returns:
         Dictionary with probability and statistics
@@ -237,14 +241,15 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
         print(f"Required Change: {((target_price / S0) - 1) * 100:+.2f}%")
     
     # Normalize weights to sum to 1.0
-    total_weight = weight_15m + weight_1h + weight_6h
+    total_weight = weight_5m + weight_15m + weight_1h + weight_6h
     if total_weight > 0:
+        weight_5m_norm = weight_5m / total_weight
         weight_15m_norm = weight_15m / total_weight
         weight_1h_norm = weight_1h / total_weight
         weight_6h_norm = weight_6h / total_weight
     else:
         # Fallback to equal weights if all zero
-        weight_15m_norm = weight_1h_norm = weight_6h_norm = 1.0 / 3.0
+        weight_5m_norm = weight_15m_norm = weight_1h_norm = weight_6h_norm = 1.0 / 4.0
     
     # Estimate parameters using weighted multi-timeframe approach
     if verbose:
@@ -252,20 +257,32 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
         print(f"ESTIMATING PARAMETERS (Risk-Neutral {model.upper()})")
         print(f"{'='*80}")
         print(f"Using weighted estimates from multiple timeframes:")
-        print(f"  - Last 15 minutes (weight: {weight_15m_norm:.2f})")
-        print(f"  - Last 1 hour (weight: {weight_1h_norm:.2f})")
-        print(f"  - Last 6 hours (weight: {weight_6h_norm:.2f})")
+        if one_minute_prices_data is not None and len(one_minute_prices_data) >= 30:
+            print(f"  - 1-minute queue (weight: 0.50) - highest priority")
+            print(f"  - Last 5 minutes (weight: {weight_5m_norm * 0.5:.2f})")
+            print(f"  - Last 15 minutes (weight: {weight_15m_norm * 0.5:.2f})")
+            print(f"  - Last 1 hour (weight: {weight_1h_norm * 0.5:.2f})")
+            print(f"  - Last 6 hours (weight: {weight_6h_norm * 0.5:.2f})")
+        else:
+            print(f"  - Last 5 minutes (weight: {weight_5m_norm:.2f})")
+            print(f"  - Last 15 minutes (weight: {weight_15m_norm:.2f})")
+            print(f"  - Last 1 hour (weight: {weight_1h_norm:.2f})")
+            print(f"  - Last 6 hours (weight: {weight_6h_norm:.2f})")
     
     minutes_ahead = int(hours_ahead * 60)
     
     # Extract prices for each timeframe
     last_timestamp = last_ts
+    prices_5m = extract_prices_for_window(prices, last_timestamp, minutes=5, data_step_seconds=data_step_seconds)
     prices_15m = extract_prices_for_window(prices, last_timestamp, minutes=15, data_step_seconds=data_step_seconds)
     prices_1h = extract_prices_for_window(prices, last_timestamp, minutes=60, data_step_seconds=data_step_seconds)
     prices_6h = extract_prices_for_window(prices, last_timestamp, minutes=360, data_step_seconds=data_step_seconds)
     
     if verbose:
         print(f"\nData points per timeframe:")
+        if one_minute_prices_data is not None:
+            print(f"  1-minute queue:  {len(one_minute_prices_data)} points (per-second)")
+        print(f"  Last 5 minutes:  {len(prices_5m)} points")
         print(f"  Last 15 minutes: {len(prices_15m)} points")
         print(f"  Last 1 hour:     {len(prices_1h)} points")
         print(f"  Last 6 hours:    {len(prices_6h)} points")
@@ -277,7 +294,9 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
     # Use last timestamp as part of key - when queue updates, timestamp changes, so we recalculate
     # This ensures we cache parameters between queue updates (every 5 seconds) but recalculate
     # when new data arrives, which is exactly what we want
-    cache_key = (model, weight_15m_norm, weight_1h_norm, weight_6h_norm, last_timestamp)
+    # Include 1-minute queue timestamp if available
+    one_min_ts_key = one_minute_last_timestamp if one_minute_prices_data is not None and len(one_minute_prices_data) >= 30 else None
+    cache_key = (model, weight_5m_norm, weight_15m_norm, weight_1h_norm, weight_6h_norm, last_timestamp, one_min_ts_key)
     
     # Check parameter cache
     if cache_key in _data_cache['params_cache']:
@@ -288,13 +307,14 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
         # Estimate parameters (not cached)
         if model == 'gbm':
             # Estimate GBM parameters from each timeframe
+            params_5m = estimate_gbm_params(prices_5m, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_5m) >= 5 else None
             params_15m = estimate_gbm_params(prices_15m, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_15m) >= 10 else None
             params_1h = estimate_gbm_params(prices_1h, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_1h) >= 30 else None
             params_6h = estimate_gbm_params(prices_6h, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_6h) >= 100 else None
             
             # Weight and combine (more recent = higher weight)
-            weights = [weight_15m_norm, weight_1h_norm, weight_6h_norm]  # 15m, 1h, 6h
-            params_list = [params_15m, params_1h, params_6h]
+            weights = [weight_5m_norm, weight_15m_norm, weight_1h_norm, weight_6h_norm]  # 5m, 15m, 1h, 6h
+            params_list = [params_5m, params_15m, params_1h, params_6h]
             
             # Filter out None values and normalize weights
             valid_params = [(p, w) for p, w in zip(params_list, weights) if p is not None]
@@ -316,7 +336,7 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
                 print(f"  Drift (μ):     {mu_dt:.8f} (risk-neutral = 0)")
                 print(f"  Volatility (σ): {sigma_dt:.8f}")
                 print(f"\nContributions:")
-                timeframe_names = ["15m", "1h", "6h"]
+                timeframe_names = ["5m", "15m", "1h", "6h"]
                 for p, w in normalized_params:
                     idx = params_list.index(p)
                     timeframe = timeframe_names[idx]
@@ -327,13 +347,40 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
             
         elif model == 'merton':
             # Estimate Merton parameters from each timeframe
+            params_5m = estimate_merton_params(prices_5m, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_5m) >= 5 else None
             params_15m = estimate_merton_params(prices_15m, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_15m) >= 10 else None
             params_1h = estimate_merton_params(prices_1h, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_1h) >= 30 else None
             params_6h = estimate_merton_params(prices_6h, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_6h) >= 100 else None
             
+            # Estimate from 1-minute queue if available (per-second data)
+            params_1min = None
+            weight_1min_norm = 0.0
+            if one_minute_prices_data is not None and len(one_minute_prices_data) >= 30:
+                # 1-minute queue has per-second data, so time_period_seconds=1
+                params_1min = estimate_merton_params(one_minute_prices_data, risk_neutral=True, drift_factor=0.0, time_period_seconds=1)
+                # Give 1-minute queue highest weight (50% of total), redistribute others proportionally
+                weight_1min_raw = 0.5
+                remaining_weight = 1.0 - weight_1min_raw
+                # Redistribute existing weights proportionally
+                weight_5m_norm_adj = weight_5m_norm * remaining_weight
+                weight_15m_norm_adj = weight_15m_norm * remaining_weight
+                weight_1h_norm_adj = weight_1h_norm * remaining_weight
+                weight_6h_norm_adj = weight_6h_norm * remaining_weight
+                weight_1min_norm = weight_1min_raw
+            else:
+                # No 1-minute queue data, use original weights
+                weight_5m_norm_adj = weight_5m_norm
+                weight_15m_norm_adj = weight_15m_norm
+                weight_1h_norm_adj = weight_1h_norm
+                weight_6h_norm_adj = weight_6h_norm
+            
             # Weight and combine (more recent = higher weight)
-            weights = [weight_15m_norm, weight_1h_norm, weight_6h_norm]  # 15m, 1h, 6h
-            params_list = [params_15m, params_1h, params_6h]
+            if params_1min is not None:
+                weights = [weight_1min_norm, weight_5m_norm_adj, weight_15m_norm_adj, weight_1h_norm_adj, weight_6h_norm_adj]  # 1min, 5m, 15m, 1h, 6h
+                params_list = [params_1min, params_5m, params_15m, params_1h, params_6h]
+            else:
+                weights = [weight_5m_norm, weight_15m_norm, weight_1h_norm, weight_6h_norm]  # 5m, 15m, 1h, 6h
+                params_list = [params_5m, params_15m, params_1h, params_6h]
             
             # Filter out None values and normalize weights
             valid_params = [(p, w) for p, w in zip(params_list, weights) if p is not None]
@@ -367,7 +414,10 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
                 print(f"  Jump mean (μ_J):    {mu_J:.8f}")
                 print(f"  Jump std (δ):       {delta:.8f}")
                 print(f"\nContributions:")
-                timeframe_names = ["15m", "1h", "6h"]
+                if params_1min is not None:
+                    timeframe_names = ["1min", "5m", "15m", "1h", "6h"]
+                else:
+                    timeframe_names = ["5m", "15m", "1h", "6h"]
                 for p, w in normalized_params:
                     idx = params_list.index(p)
                     timeframe = timeframe_names[idx]
@@ -506,22 +556,28 @@ Examples:
         help='Skip dataset update and use existing CSV file'
     )
     parser.add_argument(
+        '--weight-5m',
+        type=float,
+        default=0.4,
+        help='Weight for 5-minute timeframe (default: 0.4)'
+    )
+    parser.add_argument(
         '--weight-15m',
         type=float,
-        default=0.5,
-        help='Weight for 15-minute timeframe (default: 0.5)'
+        default=0.3,
+        help='Weight for 15-minute timeframe (default: 0.3)'
     )
     parser.add_argument(
         '--weight-1h',
         type=float,
-        default=0.3,
-        help='Weight for 1-hour timeframe (default: 0.3)'
+        default=0.2,
+        help='Weight for 1-hour timeframe (default: 0.2)'
     )
     parser.add_argument(
         '--weight-6h',
         type=float,
-        default=0.2,
-        help='Weight for 6-hour timeframe (default: 0.2)'
+        default=0.1,
+        help='Weight for 6-hour timeframe (default: 0.1)'
     )
     
     args = parser.parse_args()
@@ -543,6 +599,7 @@ Examples:
         args.hours,
         lookback_hours=args.lookback,
         model=args.model,
+        weight_5m=args.weight_5m,
         weight_15m=args.weight_15m,
         weight_1h=args.weight_1h,
         weight_6h=args.weight_6h,
