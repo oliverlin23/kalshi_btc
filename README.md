@@ -169,22 +169,6 @@ Get current position for a specific ticker.
 
 ---
 
-### Trade Logging
-
-#### `write_trade_to_csv(timestamp, ticker, action, amount, avg_price, csv_file="trades.csv")`
-
-Write trade details to CSV file for record keeping.
-
-**Why useful for Bitcoin trading:**
-
-- Maintain a complete trading history
-- Analyze performance over time
-- Calculate P&L and track profitability
-- Required for tax reporting and compliance
-- Essential for backtesting and strategy refinement
-
----
-
 ## Configuration
 
 ### Environment Variables

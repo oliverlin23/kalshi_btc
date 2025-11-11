@@ -3,7 +3,6 @@ from dotenv import load_dotenv
 
 import requests
 import os
-import csv
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from datetime import datetime
@@ -293,39 +292,6 @@ def get_available_funds():
         raise ValueError(f"Error fetching balance: {e}")
 
 
-def write_trade_to_csv(timestamp, ticker, action, amount, avg_price, csv_file="trades.csv"):
-    """
-    Write trade details to CSV file.
-
-    Args:
-        timestamp: Timestamp string
-        ticker: Market ticker (e.g., "BTC-UP-20241231")
-        action: "buy" or "sell"
-        amount: Number of contracts
-        avg_price: Average execution price in decimal format (0-1)
-        csv_file: Path to CSV file (default: "trades.csv")
-    """
-    file_exists = os.path.exists(csv_file)
-
-    try:
-        with open(csv_file, 'a', newline='') as f:
-            fieldnames = ['timestamp', 'ticker', 'action', 'amount', 'avg_price']
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-
-            if not file_exists:
-                writer.writeheader()
-
-            writer.writerow({
-                'timestamp': timestamp,
-                'ticker': ticker,
-                'action': action,
-                'amount': amount,
-                'avg_price': avg_price
-            })
-    except Exception as e:
-        print(f"Error writing trade to CSV: {e}")
-
-
 def execute_trade_by_ticker(ticker, action, count, limit_price=None):
     """
     Execute a trade on Kalshi for the specified ticker.
@@ -416,15 +382,6 @@ def execute_trade_by_ticker(ticker, action, count, limit_price=None):
             execution_price = get_kalshi_price_by_ticker(ticker, action=action)
 
         print(f"{action.capitalize()} order executed: {count} contracts at ~${execution_price:.3f}")
-
-        # Log trade to CSV
-        write_trade_to_csv(
-            timestamp=datetime.now().isoformat(),
-            ticker=ticker,
-            action=action,
-            amount=count,
-            avg_price=execution_price
-        )
 
         return {
             "order_id": order_response.order.order_id,

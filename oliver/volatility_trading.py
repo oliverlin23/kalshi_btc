@@ -11,6 +11,9 @@ import time
 import csv
 import requests
 import threading
+import random
+import math
+import numpy as np
 from datetime import datetime, timedelta, timezone
 from collections import deque
 from typing import Optional, Tuple, List
@@ -43,14 +46,19 @@ except ImportError:
 BASE_SPREAD_CENTS = 8  # Base spread in cents (minimum spread)
 VOLATILITY_MULTIPLIER = 2500  # Multiplier to convert volatility to spread (tune this)
 MAX_SPREAD_CENTS = 50  # Maximum spread in cents (safety limit)
-VOLUME = 25  # Number of contracts to trade per side
+VOLUME = 25  # Base number of contracts to trade per side (used as fallback)
+MAX_POSITION_PCT_OF_BALANCE = 0.20  # Maximum position size as % of available balance (20%)
+KELLY_FRACTION = 0.25  # Fraction of Kelly criterion to use (25% = quarter Kelly, more conservative)
+MIN_POSITION_SIZE = 5  # Minimum contracts to trade (for small balances)
 CYCLE_INTERVAL_SECONDS = 1  # Time to wait between trading cycles
 MARKET_MAKING_BUFFER_CENTS = 1  # Minimum distance from market price to ensure market making (in cents)
 MARKET_TAKING_FEE_RATE = 0.07  # Fee rate for market taking: 0.07 * p * (1-p)
 
 # Data frequency settings
-DATA_STEP_SECONDS = 5  # 1 for per-second, 5 for per-5-second, 60 for per-minute
-DATA_HOURS_BACK = 6    # Hours of historical data to fetch at startup
+# Maintains a rolling window of price data to get model parameters from
+# like volatility, drift, etc.
+DATA_STEP_SECONDS = 5  # Size of the rolling window intervals in seconds
+DATA_HOURS_BACK = 6    # Initializes the cache
 
 # Prediction settings
 PREDICTION_MODEL = 'gbm'  # 'merton' or 'gbm' (analytical only)
@@ -70,6 +78,14 @@ price_data_initialized = False
 last_price_update_time = 0.0  # Track when we last updated the price queue
 price_queue_lock = threading.Lock()  # Lock for thread-safe queue access
 price_queue_thread = None  # Background thread for queue updates
+
+# Cache for price data arrays (numpy arrays for efficiency)
+_price_data_cache = {
+    'prices_array': None,
+    'last_ts': None,
+    'last_price': None,
+    'queue_hash': None  # Hash of queue contents to detect changes
+}
 
 # Track recent order IDs to monitor for fills
 recent_order_ids = deque(maxlen=100)  # Keep last 100 order IDs
@@ -92,8 +108,8 @@ last_order_details = {
 
 # Log file paths - all logs go to logs/ directory
 LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
-CYCLES_LOG_FILE = os.path.join(LOGS_DIR, "volatility_trading_cycles.log")
-FILLS_LOG_FILE = os.path.join(LOGS_DIR, "volatility_trading_fills.log")
+CYCLES_LOG_FILE = os.path.join(LOGS_DIR, "volatility_trading_cycles.csv")
+FILLS_LOG_FILE = os.path.join(LOGS_DIR, "volatility_trading_fills.csv")
 
 # Track positions per ticker: {ticker: {'position': int, 'total_buy_cost': float, 'total_sell_revenue': float, 'buy_count': int, 'sell_count': int}}
 positions = {}
@@ -110,13 +126,14 @@ def init_log_files():
     
     # Cycles log: timestamp, cycle_num, ticker, btc_price_from_ticker, btc_price_current, threshold_price, 
     # predicted_price, volatility, spread_cents, hours_until_resolution, resolution_datetime, time_to_resolution,
-    # limit_prices (buy/sell), order_ids (buy/sell), status, error
+    # limit_prices (buy/sell), order_ids (buy/sell), buy_position_size, sell_position_size, available_balance, market_price, status, error
     if not os.path.exists(CYCLES_LOG_FILE):
         with open(CYCLES_LOG_FILE, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['timestamp', 'cycle_num', 'ticker', 'btc_price_from_ticker', 'btc_price_current', 
                            'threshold_price', 'predicted_price', 'volatility', 'spread_cents', 'hours_until_resolution',
-                           'resolution_datetime', 'time_to_resolution', 'limit_prices', 'order_ids', 'status', 'error'])
+                           'resolution_datetime', 'time_to_resolution', 'limit_prices', 'order_ids', 
+                           'buy_position_size', 'sell_position_size', 'available_balance', 'market_price', 'status', 'error'])
     
     # Fills log: timestamp, order_id, fill_id, ticker, action, side, count, price
     if not os.path.exists(FILLS_LOG_FILE):
@@ -159,8 +176,10 @@ def log_cycle(timestamp: str, cycle_num: int, ticker: str, btc_price_from_ticker
               volatility: float, spread_cents: float, hours_until_resolution: float,
               resolution_datetime: str, time_to_resolution: str,
               buy_limit_price: Optional[float], sell_limit_price: Optional[float],
-              buy_order_id: Optional[str], sell_order_id: Optional[str], 
-              status: str, error: Optional[str] = None):
+              buy_order_id: Optional[str], sell_order_id: Optional[str],
+              buy_position_size: Optional[int] = None, sell_position_size: Optional[int] = None,
+              available_balance: Optional[float] = None, market_price: Optional[float] = None,
+              status: str = '', error: Optional[str] = None):
     """Log cycle action to cycles log file."""
     try:
         with open(CYCLES_LOG_FILE, 'a', newline='') as f:
@@ -170,7 +189,9 @@ def log_cycle(timestamp: str, cycle_num: int, ticker: str, btc_price_from_ticker
             limit_prices = f"{buy_limit_price or ''}/{sell_limit_price or ''}"
             writer.writerow([timestamp, cycle_num, ticker, btc_price_from_ticker, btc_price_current,
                            threshold_price, predicted_price, volatility, spread_cents, hours_until_resolution,
-                           resolution_datetime, time_to_resolution, limit_prices, order_ids, status, error or ''])
+                           resolution_datetime, time_to_resolution, limit_prices, order_ids,
+                           buy_position_size or '', sell_position_size or '', available_balance or '', market_price or '',
+                           status, error or ''])
     except Exception as e:
         print(f"Warning: Could not write to cycles log: {e}")
 
@@ -623,11 +644,122 @@ def calculate_market_taking_fee(price: float) -> float:
     return MARKET_TAKING_FEE_RATE * price * (1.0 - price)
 
 
+def calculate_optimal_position_size(
+    predicted_prob: float,
+    market_price: Optional[float],
+    available_balance: Optional[float] = None,
+    volatility: Optional[float] = None
+) -> int:
+    """
+    Calculate optimal position size using Kelly criterion with risk limits.
+    
+    Kelly formula: f* = (p * b - q) / b
+    where:
+    - p = probability of winning (predicted_prob)
+    - q = probability of losing (1 - p)
+    - b = net odds received on the wager
+    
+    For binary options:
+    - If we buy at price P, we win (1-P) if correct, lose P if wrong
+    - Net odds b = (1-P) / P = (1/P) - 1
+    
+    Args:
+        predicted_prob: Our predicted probability (0-1)
+        market_price: Current market price (0-1), None if unavailable
+        available_balance: Available balance in dollars, None to skip balance check
+        volatility: Volatility estimate (for confidence adjustment)
+    
+    Returns:
+        Optimal number of contracts to trade
+    """
+    # Fallback to base volume if we can't calculate optimal size
+    if market_price is None:
+        return VOLUME
+    
+    # Calculate edge: difference between our prediction and market price
+    edge = abs(predicted_prob - market_price)
+    
+    # If edge is too small (< 1%), use base volume
+    if edge < 0.01:
+        return VOLUME
+    
+    # Determine which side has edge
+    if predicted_prob > market_price:
+        # We think it's more likely than market - buy YES
+        # Win probability = predicted_prob
+        # If we buy at market_price, we win (1 - market_price) if correct, lose market_price if wrong
+        p = predicted_prob
+        win_amount = 1.0 - market_price  # What we get if we win
+        lose_amount = market_price  # What we lose if we're wrong
+    else:
+        # We think it's less likely than market - sell YES (or buy NO)
+        # Win probability = 1 - predicted_prob
+        p = 1.0 - predicted_prob
+        win_amount = market_price  # What we get if we win (selling YES at market_price)
+        lose_amount = 1.0 - market_price  # What we lose if we're wrong
+    
+    # Net odds: b = win_amount / lose_amount
+    if lose_amount == 0:
+        return VOLUME  # Avoid division by zero
+    
+    b = win_amount / lose_amount
+    
+    # Kelly criterion: f* = (p * b - q) / b
+    # where q = 1 - p
+    q = 1.0 - p
+    kelly_fraction = (p * b - q) / b
+    
+    # Apply Kelly fraction multiplier (use quarter Kelly for safety)
+    kelly_fraction *= KELLY_FRACTION
+    
+    # Ensure non-negative
+    kelly_fraction = max(0.0, kelly_fraction)
+    
+    # If Kelly suggests very small position, use base volume
+    if kelly_fraction < 0.01:
+        return VOLUME
+    
+    # Calculate position size based on balance
+    if available_balance is not None and available_balance > 0:
+        # Maximum we're willing to risk per contract
+        # For buying: risk = market_price per contract
+        # For selling: risk = (1 - market_price) per contract
+        if predicted_prob > market_price:
+            risk_per_contract = market_price
+        else:
+            risk_per_contract = 1.0 - market_price
+        
+        # Calculate position size from Kelly fraction
+        # Position value = kelly_fraction * available_balance
+        position_value = kelly_fraction * available_balance
+        
+        # Number of contracts = position_value / risk_per_contract
+        contracts_from_kelly = int(position_value / risk_per_contract)
+        
+        # Apply maximum position size limit
+        max_contracts_from_balance = int((MAX_POSITION_PCT_OF_BALANCE * available_balance) / risk_per_contract)
+        
+        # Take minimum of Kelly suggestion and max limit
+        optimal_contracts = min(contracts_from_kelly, max_contracts_from_balance)
+        
+        # Ensure minimum position size
+        optimal_contracts = max(optimal_contracts, MIN_POSITION_SIZE)
+        
+        return optimal_contracts
+    else:
+        # No balance info - scale base volume by edge and Kelly fraction
+        # Scale by edge: larger edge = larger position
+        edge_multiplier = min(edge / 0.05, 2.0)  # Cap at 2x for edges > 5%
+        scaled_volume = int(VOLUME * edge_multiplier * kelly_fraction * 4)  # *4 to scale from fraction to reasonable size
+        return max(scaled_volume, MIN_POSITION_SIZE)
+
+
 def place_limit_order_with_spread(
     ticker: str,
     predicted_price: float,
     volatility: float,
-    action: str = "buy"
+    action: str = "buy",
+    position_size: Optional[int] = None
 ) -> Tuple[Optional[dict], Optional[float], Optional[str]]:
     """
     Place a limit order with dynamic spread offset from predicted price.
@@ -688,11 +820,14 @@ def place_limit_order_with_spread(
     if limit_price is None:
         return None, limit_price_raw, f"Invalid limit price: {limit_price_raw:.4f}"
     
+    # Use provided position size or fallback to base volume
+    count = position_size if position_size is not None else VOLUME
+    
     try:
         result = execute_trade_by_ticker(
             ticker=ticker,
             action=action,
-            count=VOLUME,
+            count=count,
             limit_price=limit_price
         )
         
@@ -740,10 +875,37 @@ def initialize_price_queue_from_bitstamp():
         
         price_data_queue.clear()
         
+        # Clear price data cache since we're reinitializing
+        global _price_data_cache
+        _price_data_cache['queue_hash'] = None
+        _price_data_cache['prices_array'] = None
+        
         # If we want per-second or per-5-second data, we need to interpolate from 1-minute data
-        # and then start polling ticker API for real-time updates
+        # Use volatility-preserving interpolation to maintain reasonable parameters on cold start
         if DATA_STEP_SECONDS < 60:
-            # For finer granularity, interpolate from 1-minute data
+            # First, estimate volatility from 1-minute data to guide interpolation
+            if len(ohlc_data) >= 2:
+                # Extract prices as numpy array for efficient calculation
+                prices_array = np.array([price for _, price in ohlc_data[:100]], dtype=np.float64)  # Use up to 100 points
+                
+                if len(prices_array) >= 2:
+                    # Calculate log returns using numpy (more efficient)
+                    log_returns = np.diff(np.log(prices_array))
+                    
+                    # Estimate per-minute volatility using numpy std (sample std, ddof=1)
+                    if len(log_returns) >= 2:
+                        minute_volatility = log_returns.std(ddof=1)
+                        # Scale to per-interval volatility (for DATA_STEP_SECONDS)
+                        interval_volatility = minute_volatility * np.sqrt(DATA_STEP_SECONDS / 60.0)
+                    else:
+                        # Fallback: use a reasonable default volatility
+                        interval_volatility = 0.001 * np.sqrt(DATA_STEP_SECONDS / 60.0)  # ~0.1% per minute
+                else:
+                    interval_volatility = 0.001 * np.sqrt(DATA_STEP_SECONDS / 60.0)
+            else:
+                interval_volatility = 0.001 * np.sqrt(DATA_STEP_SECONDS / 60.0)
+            
+            # For finer granularity, interpolate from 1-minute data using Brownian bridge
             # Each minute has 60 seconds, so we'll create DATA_STEP_SECONDS intervals per minute
             points_per_minute = 60 // DATA_STEP_SECONDS
             
@@ -751,21 +913,62 @@ def initialize_price_queue_from_bitstamp():
                 # Add the minute data point
                 price_data_queue.append((ts, price))
                 
-                # If not the last point, interpolate intermediate points
+                # If not the last point, interpolate intermediate points using Brownian bridge
                 if i < len(ohlc_data) - 1:
                     next_ts, next_price = ohlc_data[i + 1]
                     time_diff = next_ts - ts
                     price_diff = next_price - price
                     
-                    # Add interpolated points between this minute and next
-                    for j in range(1, points_per_minute):
-                        interp_ts = ts + (j * DATA_STEP_SECONDS)
-                        if interp_ts < next_ts:
-                            # Linear interpolation
-                            interp_price = price + (price_diff * (j / points_per_minute))
-                            price_data_queue.append((interp_ts, interp_price))
+                    # Use Brownian bridge interpolation to preserve volatility
+                    # This creates a random walk between endpoints that preserves variance
+                    # Brownian bridge variance at time t: sigma^2 * t * (1 - t)
+                    num_intervals = points_per_minute - 1
+                    if num_intervals > 0:
+                        # Generate deviations from linear interpolation with proper variance
+                        # The variance of a Brownian bridge at time t is sigma^2 * t * (1 - t)
+                        bridge_deviations = []
+                        for j in range(1, num_intervals + 1):
+                            t = j / points_per_minute
+                            
+                            # Brownian bridge variance: var(t) = sigma^2 * t * (1 - t)
+                            # This ensures variance is 0 at endpoints and maximum in the middle
+                            variance_bridge = interval_volatility**2 * t * (1 - t)
+                            std_bridge = math.sqrt(max(0, variance_bridge))
+                            
+                            if j < num_intervals:
+                                # Generate deviation from linear interpolation
+                                deviation = random.gauss(0, std_bridge)
+                                bridge_deviations.append(deviation)
+                            else:
+                                # Last point: ensure bridge ends at next_price (sum of deviations = 0)
+                                bridge_deviations.append(-sum(bridge_deviations))
+                        
+                        # Build cumulative bridge path (deviations from linear interpolation)
+                        bridge_path = [0.0]  # Start at 0 (no deviation at start)
+                        for dev in bridge_deviations:
+                            bridge_path.append(bridge_path[-1] + dev)
+                        
+                        # Add interpolated points
+                        for j in range(1, points_per_minute):
+                            interp_ts = ts + (j * DATA_STEP_SECONDS)
+                            if interp_ts < next_ts:
+                                # Linear interpolation component
+                                t = j / points_per_minute
+                                linear_component = price + t * price_diff
+                                
+                                # Bridge deviation component (preserves volatility)
+                                bridge_component = bridge_path[j] if j < len(bridge_path) else 0.0
+                                
+                                interp_price = linear_component + bridge_component
+                                
+                                # Ensure price stays reasonable (within 1% bounds)
+                                min_price = min(price, next_price) * 0.99
+                                max_price = max(price, next_price) * 1.01
+                                interp_price = max(min_price, min(max_price, interp_price))
+                                
+                                price_data_queue.append((interp_ts, interp_price))
             
-            print(f"  Interpolated to {DATA_STEP_SECONDS}-second intervals: {len(price_data_queue)} points")
+            print(f"  Interpolated to {DATA_STEP_SECONDS}-second intervals using volatility-preserving method: {len(price_data_queue)} points")
             
             # Fetch current price to add most recent point
             current_ticker = fetch_bitstamp_ticker()
@@ -847,6 +1050,11 @@ def update_price_queue():
             # Clear parameter cache to force volatility recalculation with fresh data
             clear_parameter_cache()
             
+            # Clear price data cache since queue has changed
+            global _price_data_cache
+            _price_data_cache['queue_hash'] = None
+            _price_data_cache['prices_array'] = None
+            
             if intervals_to_catch_up > 1:
                 print(f"  Caught up {intervals_to_catch_up} missed interval(s) ({DATA_STEP_SECONDS}s each) in price queue")
             
@@ -889,28 +1097,52 @@ def start_price_queue_updater():
     print(f"  Started background price queue updater thread")
 
 
-def get_price_data_for_prediction() -> Tuple[List[float], float, float]:
+def get_price_data_for_prediction() -> Tuple[np.ndarray, float, float]:
     """
     Get price data from queue in format expected by predict_price_probability.
-    Thread-safe access to the queue.
+    Thread-safe access to the queue with caching for efficiency.
     
     Returns:
-        Tuple of (prices_array, last_timestamp, last_price)
+        Tuple of (prices_array as numpy array, last_timestamp, last_price)
     """
-    global price_data_queue
+    global price_data_queue, _price_data_cache
     
     with price_queue_lock:
         if len(price_data_queue) == 0:
             raise ValueError("Price queue is empty - cannot make predictions")
         
-        # Convert queue to arrays (create copies for thread safety)
-        timestamps = [ts for ts, _ in price_data_queue]
-        prices = [price for _, price in price_data_queue]
+        # Calculate hash of queue contents to detect changes
+        # Use first and last few timestamps/prices as a simple hash
+        queue_items = list(price_data_queue)
+        if len(queue_items) >= 4:
+            queue_hash = hash((
+                queue_items[0][0], queue_items[0][1],  # First timestamp, price
+                queue_items[-1][0], queue_items[-1][1],  # Last timestamp, price
+                len(queue_items)  # Length
+            ))
+        else:
+            queue_hash = hash(tuple(queue_items))
         
-        last_ts = timestamps[-1]
-        last_price = prices[-1]
+        # Check cache
+        if (_price_data_cache['queue_hash'] == queue_hash and 
+            _price_data_cache['prices_array'] is not None):
+            # Cache hit - return cached numpy array
+            return _price_data_cache['prices_array'], _price_data_cache['last_ts'], _price_data_cache['last_price']
         
-        return prices, last_ts, last_price
+        # Cache miss - convert queue to numpy array
+        prices_list = [price for _, price in price_data_queue]
+        prices_array = np.array(prices_list, dtype=np.float64)
+        
+        last_ts = queue_items[-1][0]
+        last_price = queue_items[-1][1]
+        
+        # Update cache
+        _price_data_cache['prices_array'] = prices_array
+        _price_data_cache['last_ts'] = last_ts
+        _price_data_cache['last_price'] = last_price
+        _price_data_cache['queue_hash'] = queue_hash
+        
+        return prices_array, last_ts, last_price
 
 
 def run_trading_cycle(cycle_num: int) -> bool:
@@ -1037,15 +1269,55 @@ def run_trading_cycle(cycle_num: int) -> bool:
         if buy_price_changed or sell_price_changed:
             need_to_update = True
     
+    # Initialize position size and balance variables (will be set if orders are updated)
+    buy_position_size = None
+    sell_position_size = None
+    available_balance = None
+    market_price = None
+    
     # Only cancel and replace if needed
     if need_to_update:
         # Cancel existing orders for current ticker
         cancel_all_orders_for_ticker(ticker)
         last_ticker = ticker
         
+        # Calculate optimal position sizes based on edge and balance
+        try:
+            from app.utils import get_available_funds, get_kalshi_price_by_ticker
+            available_balance = get_available_funds()
+            market_price = get_kalshi_price_by_ticker(ticker, action="buy")  # Use ask price as reference
+        except Exception:
+            available_balance = None
+            market_price = None
+        
+        buy_position_size = calculate_optimal_position_size(
+            predicted_prob=predicted_prob,
+            market_price=market_price,
+            available_balance=available_balance,
+            volatility=volatility
+        )
+        
+        # For sell side, use inverse probability
+        sell_position_size = calculate_optimal_position_size(
+            predicted_prob=1.0 - predicted_prob,  # Inverse for sell side
+            market_price=1.0 - market_price if market_price else None,
+            available_balance=available_balance,
+            volatility=volatility
+        )
+        
+        # Log position sizing decision
+        if market_price:
+            edge = abs(predicted_prob - market_price)
+            edge_pct = edge * 100
+            print(f"  Position sizing: edge={edge_pct:.2f}%, buy={buy_position_size}, sell={sell_position_size}, balance=${available_balance:.2f}" if available_balance else f"  Position sizing: edge={edge_pct:.2f}%, buy={buy_position_size}, sell={sell_position_size}")
+        
         # Place both buy and sell limit orders using predicted probability and volatility
-        buy_result, buy_limit_price, buy_error = place_limit_order_with_spread(ticker, predicted_prob, volatility, action="buy")
-        sell_result, sell_limit_price, sell_error = place_limit_order_with_spread(ticker, predicted_prob, volatility, action="sell")
+        buy_result, buy_limit_price, buy_error = place_limit_order_with_spread(
+            ticker, predicted_prob, volatility, action="buy", position_size=buy_position_size
+        )
+        sell_result, sell_limit_price, sell_error = place_limit_order_with_spread(
+            ticker, predicted_prob, volatility, action="sell", position_size=sell_position_size
+        )
         
         # Update tracking
         last_order_details = {
@@ -1094,7 +1366,9 @@ def run_trading_cycle(cycle_num: int) -> bool:
     log_cycle(timestamp, cycle_num, ticker, btc_price_from_ticker, btc_price_current,
               threshold_price, predicted_prob, volatility, spread_cents, hours_until_resolution,
               resolution_datetime_str, time_to_resolution_str,
-              buy_limit_price, sell_limit_price, buy_order_id, sell_order_id, status, error_msg)
+              buy_limit_price, sell_limit_price, buy_order_id, sell_order_id,
+              buy_position_size, sell_position_size, available_balance, market_price,
+              status, error_msg)
     
     # Console output (one line)
     pred_str = f"Pred={predicted_prob:.3f}"

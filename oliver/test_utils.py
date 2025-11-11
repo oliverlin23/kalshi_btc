@@ -10,7 +10,6 @@ To run expensive tests: ENABLE_EXPENSIVE_TESTS=true pytest personal/test_utils.p
 
 import pytest
 import os
-import csv
 import tempfile
 from unittest.mock import Mock, patch, mock_open, MagicMock
 from datetime import datetime
@@ -23,7 +22,6 @@ from app.utils import (
     get_kalshi_orderbook_by_ticker,
     get_kalshi_price_impact_by_ticker,
     get_available_funds,
-    write_trade_to_csv,
     execute_trade_by_ticker,
     get_position_by_ticker,
     cancel_all_orders_for_ticker,
@@ -201,38 +199,6 @@ class TestGetAvailableFunds:
 
         with pytest.raises(ValueError, match="Error fetching balance"):
             get_available_funds()
-
-
-class TestWriteTradeToCSV:
-    """Tests for write_trade_to_csv function"""
-
-    def test_creates_file_and_writes_trade(self):
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as f:
-            csv_file = f.name
-
-        os.unlink(csv_file)
-
-        try:
-            write_trade_to_csv(
-                timestamp='2025-01-01T00:00:00',
-                ticker=TEST_TICKER,
-                action='buy',
-                amount=10,
-                avg_price=0.51,
-                csv_file=csv_file
-            )
-
-            with open(csv_file, 'r') as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-                assert len(rows) == 1
-                assert rows[0]['ticker'] == TEST_TICKER
-                assert rows[0]['action'] == 'buy'
-                assert rows[0]['amount'] == '10'
-                assert rows[0]['avg_price'] == '0.51'
-        finally:
-            if os.path.exists(csv_file):
-                os.unlink(csv_file)
 
 
 class TestExecuteTradeByTicker:

@@ -217,8 +217,11 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
     
     # Load current price and historical data
     if prices_data is not None and last_timestamp is not None and current_price is not None:
-        # Use provided data (from queue) - convert to numpy array for compatibility
-        prices = np.array(prices_data, dtype=float)
+        # Use provided data (from queue) - already numpy array from optimized get_price_data_for_prediction
+        if isinstance(prices_data, np.ndarray):
+            prices = prices_data
+        else:
+            prices = np.array(prices_data, dtype=np.float64)
         last_ts = float(last_timestamp)
         S0 = float(current_price)
     elif csv_path is not None:
@@ -271,8 +274,10 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
         print(f"{'='*80}")
     
     # Create cache key for parameter estimates
-    cache_key = (model, weight_15m_norm, weight_1h_norm, weight_6h_norm, 
-                 len(prices_15m), len(prices_1h), len(prices_6h))
+    # Use last timestamp as part of key - when queue updates, timestamp changes, so we recalculate
+    # This ensures we cache parameters between queue updates (every 5 seconds) but recalculate
+    # when new data arrives, which is exactly what we want
+    cache_key = (model, weight_15m_norm, weight_1h_norm, weight_6h_norm, last_timestamp)
     
     # Check parameter cache
     if cache_key in _data_cache['params_cache']:
