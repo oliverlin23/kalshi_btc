@@ -7,6 +7,7 @@ import os
 import sys
 from flask import Flask, render_template, jsonify
 from datetime import datetime, timedelta
+from typing import Optional
 import time
 import pytz
 
@@ -195,15 +196,31 @@ def index():
     return render_template('dashboard.html')
 
 
+def get_btc_price_from_bitstamp() -> Optional[int]:
+    """Fetch BTC price from Bitstamp API."""
+    try:
+        import requests
+        response = requests.get(
+            "https://www.bitstamp.net/api/v2/ticker/btcusd/",
+            timeout=5
+        )
+        response.raise_for_status()
+        data = response.json()
+        if "last" in data:
+            return int(float(data["last"]))
+    except Exception:
+        pass
+    return None
+
+
 @app.route('/api/tickers')
 def get_tickers():
     """API endpoint to get current tickers based on EST hour and BTC price."""
     try:
-        btc_price_str = os.getenv("BTC_CURRENT_PRICE", "")
-        if not btc_price_str:
-            return jsonify({"error": "BTC_CURRENT_PRICE environment variable not set"}), 400
+        btc_price = get_btc_price_from_bitstamp()
+        if not btc_price:
+            return jsonify({"error": "Could not fetch BTC price from Bitstamp"}), 400
         
-        btc_price = int(btc_price_str)
         tickers, year, month, day, hour = get_or_refresh_tickers(btc_price)
         
         return jsonify({
@@ -216,7 +233,7 @@ def get_tickers():
             "hour": hour
         })
     except ValueError as e:
-        return jsonify({"error": f"Invalid BTC_CURRENT_PRICE: {e}"}), 400
+        return jsonify({"error": f"Invalid BTC price: {e}"}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -226,17 +243,16 @@ def get_prices():
     """API endpoint to get current prices for all tickers."""
     try:
         # Get tickers (cached; refreshes only on hour change or every 60s)
-        btc_price_str = os.getenv("BTC_CURRENT_PRICE", "")
-        if not btc_price_str:
+        btc_price = get_btc_price_from_bitstamp()
+        if not btc_price:
             return jsonify({
-                "error": "BTC_CURRENT_PRICE environment variable not set. Set it with: export BTC_CURRENT_PRICE=101875",
+                "error": "Could not fetch BTC price from Bitstamp",
                 "prices": [],
                 "btc_price": None,
                 "timestamp": datetime.now().isoformat(),
                 "est_time": datetime.now(EST).isoformat()
             }), 200  # Return 200 so frontend can display the error
         
-        btc_price = int(btc_price_str)
         tickers, year, month, day, hour = get_or_refresh_tickers(btc_price)
         
         if not tickers or len(tickers) == 0:
@@ -357,11 +373,11 @@ if __name__ == '__main__':
     port = int(os.getenv("DASHBOARD_PORT", 5000))
     debug = os.getenv("FLASK_DEBUG", "False").lower() == "true"
     
-    btc_price = os.getenv("BTC_CURRENT_PRICE", "")
+    btc_price = get_btc_price_from_bitstamp()
     if not btc_price:
-        print("WARNING: BTC_CURRENT_PRICE not set. Set it with: export BTC_CURRENT_PRICE=101875")
+        print("WARNING: Could not fetch BTC price from Bitstamp")
     else:
-        print(f"BTC Current Price: ${int(btc_price):,}")
+        print(f"BTC Current Price: ${btc_price:,}")
     
     year, month, day, hour = get_current_est_hour()
     print(f"Current EST: {year}-{month:02d}-{day:02d} {hour:02d}:00")

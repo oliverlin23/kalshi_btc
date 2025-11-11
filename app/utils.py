@@ -549,7 +549,20 @@ def cancel_all_orders_for_ticker(ticker):
             try:
                 client.cancel_order(order_id=order.order_id)
                 cancelled_count += 1
-                print(f"✓ Cancelled order {order.order_id}: {order.action} {order.count} contracts of {order.ticker}")
+                # Order objects use 'remaining_count', not 'count'
+                count = getattr(order, 'remaining_count', None)
+                if count is None:
+                    count = getattr(order, 'count', None)
+                if count is None:
+                    print(f"  Warning: Order {order.order_id} missing 'remaining_count' and 'count' fields")
+                    count = 'MISSING'
+                
+                action = getattr(order, 'action', None)
+                if action is None:
+                    print(f"  Warning: Order {order.order_id} missing 'action' field")
+                    action = 'MISSING'
+                
+                print(f"✓ Cancelled order {order.order_id}: {action} {count} contracts of {order.ticker}")
             except Exception as e:
                 failed_count += 1
                 print(f"✗ Failed to cancel order {order.order_id}: {e}")

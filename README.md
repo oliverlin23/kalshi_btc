@@ -246,3 +246,77 @@ print(f"Current position: {position} contracts")
 4. **Price impact estimation**: Includes sophisticated orderbook analysis to help with large order execution.
 
 5. **Error handling**: Functions raise clear `ValueError` exceptions with descriptive messages for debugging.
+
+---
+
+## Dashboards
+
+The project includes two dashboard interfaces for monitoring Bitcoin markets:
+
+### CLI Dashboard (`app/cli_dashboard.py`)
+
+A terminal-based live dashboard for monitoring specific tickers.
+
+**Usage:**
+```bash
+# Run directly
+python -m app.cli_dashboard --tickers "BTC-UP-20241231,BTC-DOWN-20241231"
+
+# Or use the runner script
+python run_dashboard.py --tickers "BTC-UP-20241231,BTC-DOWN-20241231"
+
+# With environment variables
+export BTC_DASHBOARD_TICKERS="BTC-UP-20241231,BTC-DOWN-20241231"
+export BTC_DASHBOARD_INTERVAL=0.5
+python run_dashboard.py
+```
+
+**Features:**
+- Real-time price updates (configurable refresh interval, default 0.5s)
+- Shows buy (ask), sell (bid), and spread for each ticker
+- Simple text table output
+- Press Ctrl-C to exit
+
+**Options:**
+- `--tickers`: Comma-separated list of tickers to monitor
+- `--interval`: Refresh interval in seconds (default: 0.5)
+- `--action`: Show "buy", "sell", or "both" prices (default: both)
+
+### Web Dashboard (`app/web_dashboard.py`)
+
+A Flask-based web dashboard with auto-discovery of markets.
+
+**Usage:**
+```bash
+# Set BTC current price (required)
+export BTC_CURRENT_PRICE=101875
+
+# Run the web server
+python -m app.web_dashboard
+
+# Or with custom port
+export DASHBOARD_PORT=8080
+python -m app.web_dashboard
+```
+
+Then open `http://localhost:5000` (or your custom port) in your browser.
+
+**Features:**
+- Auto-generates 6 markets (3 range, 3 threshold) closest to current BTC price
+- Real-time price updates via JSON API
+- Shows orderbook volumes, spreads, and market types
+- Caching (refreshes every 60 seconds or on hour change)
+- Can fetch from Kalshi API or generate tickers locally
+
+**API Endpoints:**
+- `GET /` - Main dashboard HTML page
+- `GET /api/tickers` - Get available tickers for current EST hour
+- `GET /api/prices` - Get real-time prices for all tickers
+
+**Environment Variables:**
+- `BTC_CURRENT_PRICE` (required): Current BTC price in dollars (e.g., 101875)
+- `DASHBOARD_PORT`: Port to run server on (default: 5000)
+- `FLASK_DEBUG`: Set to "true" for debug mode
+- `USE_KALSHI_MARKET_API`: Set to "true" to fetch markets from Kalshi API instead of generating locally
+
+

@@ -12,7 +12,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(script_dir)
 
 # Run the dashboard
-from app.btc_dashboard import main
+from app.cli_dashboard import main
 
 if __name__ == "__main__":
     main()

@@ -137,7 +137,7 @@ def search_btc_markets(
         # Fetch range markets (KXBTC)
         if market_type is None or market_type == 'range':
             try:
-                range_response = get_kalshi_markets(limit=limit, series_ticker='KXBTC')
+                range_response = get_kalshi_markets(limit=limit, series_ticker='KXBTC', status='open')
                 # Handle different response structures
                 markets_list = None
                 if isinstance(range_response, dict):
@@ -153,7 +153,7 @@ def search_btc_markets(
         # Fetch threshold markets (KXBTCD)
         if market_type is None or market_type == 'threshold':
             try:
-                threshold_response = get_kalshi_markets(limit=limit, series_ticker='KXBTCD')
+                threshold_response = get_kalshi_markets(limit=limit, series_ticker='KXBTCD', status='open')
                 # Handle different response structures
                 markets_list = None
                 if isinstance(threshold_response, dict):

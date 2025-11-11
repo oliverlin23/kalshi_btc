@@ -253,6 +253,37 @@ def generate_threshold_ticker_from_datetime(dt: datetime, threshold: float) -> s
     return generate_threshold_ticker(dt.year, dt.month, dt.day, dt.hour, threshold)
 
 
+def round_to_range_midpoint(price: int) -> int:
+    """
+    Round price to nearest valid range market midpoint.
+    Range market midpoints must be 125 mod 250 (e.g., 101875, 102125, 102375).
+    
+    Args:
+        price: BTC price in dollars (integer)
+    
+    Returns:
+        Nearest valid midpoint price
+    """
+    # Round to nearest 250
+    base = round(price / 250) * 250
+    
+    # Find the two closest values that are 125 mod 250
+    candidate1 = base - 125  # If base was 250 mod 250, this gives 125 mod 250
+    candidate2 = base + 125  # If base was 0 mod 250, this gives 125 mod 250
+    
+    # Ensure both are 125 mod 250
+    if candidate1 % 250 != 125:
+        candidate1 = candidate1 - 250
+    if candidate2 % 250 != 125:
+        candidate2 = candidate2 + 250
+    
+    # Return the one closest to original price
+    if abs(price - candidate1) <= abs(price - candidate2):
+        return candidate1
+    else:
+        return candidate2
+
+
 def get_ticker_info(ticker: str) -> Optional[str]:
     """
     Get a human-readable description of a ticker.

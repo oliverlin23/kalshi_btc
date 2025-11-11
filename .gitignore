@@ -1,3 +1,11 @@
 btc.txt
 .env
+oliver/logs
+kalshi_key.txt
+
+# Ignore everything pycache
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
