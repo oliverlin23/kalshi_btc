@@ -391,14 +391,10 @@ def execute_trade_by_ticker(ticker, action, count, limit_price=None):
             order_type = "limit"
             yes_price = round(limit_price * 100)
 
-        # Check balance if needed
-        available_balance = get_available_funds()
-        estimated_price = limit_price if limit_price else current_price
-        # For buy: need count * price
-        # For sell (short): need count * (1 - price) as margin for max loss
-        required_funds = count * estimated_price if action == "buy" else count * (1 - estimated_price)
-        if required_funds > available_balance:
-            raise ValueError(f"Insufficient funds: need ${required_funds:.2f}, have ${available_balance:.2f}")
+        # Note: We don't check balance here - let Kalshi handle margin/balance checks
+        # Kalshi's system accounts for existing positions, so selling when long or buying when short
+        # (reducing exposure) should be allowed even with low balance.
+        # If there are truly insufficient funds, Kalshi will reject the order with an appropriate error.
 
         # Create and execute order
         order_kwargs = {

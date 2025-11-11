@@ -239,7 +239,8 @@ def get_available_btc_tickers_for_hour(
     day: int,
     hour: int,
     btc_price: Optional[int] = None,
-    limit: int = 100
+    limit: int = 100,
+    market_type: Optional[str] = None  # 'range' or 'threshold' or None for both
 ) -> List[str]:
     """
     Get available BTC tickers for a specific hour, optionally filtered by proximity to BTC price.
@@ -251,11 +252,12 @@ def get_available_btc_tickers_for_hour(
         hour: Hour (0-23)
         btc_price: Optional BTC price to filter by proximity
         limit: Maximum number of markets to fetch
+        market_type: 'range' for interval markets, 'threshold' for threshold markets, None for both
     
     Returns:
         List of ticker strings, optionally sorted by proximity to btc_price
     """
-    markets = search_btc_markets(year=year, month=month, day=day, hour=hour, limit=limit)
+    markets = search_btc_markets(year=year, month=month, day=day, hour=hour, limit=limit, market_type=market_type)
     
     tickers = [m['ticker'] for m in markets]
     

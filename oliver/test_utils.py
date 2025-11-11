@@ -119,8 +119,8 @@ class TestGetKalshiSpreadByTicker:
         """Test with real Kalshi API - FREE"""
         try:
             spread = get_kalshi_spread_by_ticker(TEST_TICKER)
-            # Spread should be positive and reasonable (less than 10¢)
-            assert 0 <= spread <= 0.10
+        # Spread should be positive and reasonable (less than 10¢)
+        assert 0 <= spread <= 0.10
         except ValueError as e:
             if "No bid/ask prices available" in str(e) or "Error fetching spread" in str(e):
                 pytest.skip(f"Ticker {TEST_TICKER} not available or invalid")
@@ -168,10 +168,10 @@ class TestGetKalshiPriceImpactByTicker:
         """Test that price impact returns a valid float"""
         try:
             impact = get_kalshi_price_impact_by_ticker(TEST_TICKER, count=1, action="buy")
-            # Price impact can be 0.0 for small orders, or 0.01 for errors
-            # Just check it's a valid float
-            assert isinstance(impact, float)
-            assert impact >= 0.0
+        # Price impact can be 0.0 for small orders, or 0.01 for errors
+        # Just check it's a valid float
+        assert isinstance(impact, float)
+        assert impact >= 0.0
         except ValueError:
             # If ticker doesn't exist, that's okay for this test
             pass
@@ -272,20 +272,20 @@ class TestExecuteTradeByTicker:
         # For a buy order, set limit at or below market price to get a better deal
         try:
             current_price = get_kalshi_price_by_ticker(TEST_TICKER, action="buy")
-            limit_price = max(current_price - 0.05, 0.01)  # Set limit 5 cents below market (or 1 cent minimum)
+        limit_price = max(current_price - 0.05, 0.01)  # Set limit 5 cents below market (or 1 cent minimum)
 
-            # Execute limit buy order for 1 contract at limit price
+        # Execute limit buy order for 1 contract at limit price
             result = execute_trade_by_ticker(ticker=TEST_TICKER, action="buy", count=1, limit_price=limit_price)
 
-            assert result is not None
-            assert "order_id" in result
-            assert result["order_type"] == "limit"
-            assert 0 <= result["execution_price"] <= limit_price
-            
-            # Cancel the limit order after test
+        assert result is not None
+        assert "order_id" in result
+        assert result["order_type"] == "limit"
+        assert 0 <= result["execution_price"] <= limit_price
+        
+        # Cancel the limit order after test
             cancelled_count, failed_count = cancel_all_orders_for_ticker(TEST_TICKER)
-            assert cancelled_count >= 0  # Should have cancelled at least the order we just created
-            assert failed_count == 0  # Should not have any failures
+        assert cancelled_count >= 0  # Should have cancelled at least the order we just created
+        assert failed_count == 0  # Should not have any failures
         except ValueError as e:
             if "No ask price available" in str(e) or "Error fetching Kalshi price" in str(e):
                 pytest.skip(f"Ticker {TEST_TICKER} not available or invalid")
@@ -300,34 +300,34 @@ class TestExecuteTradeByTicker:
         cancel_all_orders_for_ticker(TEST_TICKER)
         
         try:
-            # Get initial position
+        # Get initial position
             initial_position = get_position_by_ticker(TEST_TICKER)
-            
-            # Step 1: Buy 1 contract (go long)
+        
+        # Step 1: Buy 1 contract (go long)
             buy_result = execute_trade_by_ticker(ticker=TEST_TICKER, action="buy", count=1, limit_price=None)
-            assert buy_result is not None
-            assert buy_result["action"] == "buy"
-            assert buy_result["count"] == 1
-            
-            # Wait for position to update
-            time.sleep(5)
-            
-            # Verify we have 1 long position
+        assert buy_result is not None
+        assert buy_result["action"] == "buy"
+        assert buy_result["count"] == 1
+        
+        # Wait for position to update
+        time.sleep(5)
+        
+        # Verify we have 1 long position
             position_after_buy = get_position_by_ticker(TEST_TICKER)
-            assert position_after_buy >= 1, f"Expected at least 1 long position after buy, got {position_after_buy}"
-            
-            # Step 2: Sell 2 contracts (this will cover the 1 long and create 1 short)
+        assert position_after_buy >= 1, f"Expected at least 1 long position after buy, got {position_after_buy}"
+        
+        # Step 2: Sell 2 contracts (this will cover the 1 long and create 1 short)
             sell_result = execute_trade_by_ticker(ticker=TEST_TICKER, action="sell", count=2, limit_price=None)
-            assert sell_result is not None
-            assert sell_result["action"] == "sell"
-            assert sell_result["count"] == 2
-            
-            # Wait for position to update
-            time.sleep(5)
-            
-            # Verify we have net short position of -1
+        assert sell_result is not None
+        assert sell_result["action"] == "sell"
+        assert sell_result["count"] == 2
+        
+        # Wait for position to update
+        time.sleep(5)
+        
+        # Verify we have net short position of -1
             final_position = get_position_by_ticker(TEST_TICKER)
-            assert final_position == -1, f"Expected net short position of -1, got {final_position}"
+        assert final_position == -1, f"Expected net short position of -1, got {final_position}"
         except ValueError as e:
             if "No ask price available" in str(e) or "Error fetching Kalshi price" in str(e):
                 pytest.skip(f"Ticker {TEST_TICKER} not available or invalid")
@@ -379,28 +379,28 @@ class TestCancelAllOrdersForTicker:
         # First, create a limit order that will likely remain outstanding
         try:
             current_price = get_kalshi_price_by_ticker(TEST_TICKER, action="buy")
-            limit_price = max(current_price - 0.10, 0.01)  # Set limit well below market so it won't fill
-            
-            # Create limit order
+        limit_price = max(current_price - 0.10, 0.01)  # Set limit well below market so it won't fill
+        
+        # Create limit order
             order_result = execute_trade_by_ticker(ticker=TEST_TICKER, action="buy", count=1, limit_price=limit_price)
-            assert order_result is not None
-            assert order_result["order_type"] == "limit"
-            
-            # Give it a moment to appear in the system
-            import time
-            time.sleep(2)
-            
+        assert order_result is not None
+        assert order_result["order_type"] == "limit"
+        
+        # Give it a moment to appear in the system
+        import time
+        time.sleep(2)
+        
             # Cancel all orders for the ticker
             cancelled_count, failed_count = cancel_all_orders_for_ticker(TEST_TICKER)
-            
-            # Should have cancelled at least the order we just created
-            assert cancelled_count >= 1
-            assert failed_count == 0
-            
-            # Verify no orders remain by trying to cancel again
+        
+        # Should have cancelled at least the order we just created
+        assert cancelled_count >= 1
+        assert failed_count == 0
+        
+        # Verify no orders remain by trying to cancel again
             cancelled_count_2, failed_count_2 = cancel_all_orders_for_ticker(TEST_TICKER)
-            assert cancelled_count_2 == 0  # No orders should remain
-            assert failed_count_2 == 0
+        assert cancelled_count_2 == 0  # No orders should remain
+        assert failed_count_2 == 0
         except ValueError as e:
             if "No ask price available" in str(e) or "Error fetching Kalshi price" in str(e):
                 pytest.skip(f"Ticker {TEST_TICKER} not available or invalid")

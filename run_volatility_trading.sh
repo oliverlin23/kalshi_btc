@@ -12,7 +12,7 @@ else
     echo "Starting new tmux session '$TMUX_SESSION'..."
     # Create new tmux session and run the algorithm with caffeinate
     tmux new-session -d -s "$TMUX_SESSION" -c "$SCRIPT_DIR" \
-        "caffeinate -i uv run python personal/volatility_trading.py"
+        "caffeinate -i uv run python oliver/volatility_trading.py"
     
     echo "Session started. Attaching..."
     tmux attach-session -t "$TMUX_SESSION"
