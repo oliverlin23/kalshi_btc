@@ -91,25 +91,60 @@ def estimate_merton_params(min_prices, c=3.5, risk_neutral=False, risk_free_rate
     historical_mu = r.mean()
     
     # Jump detection via robust threshold
-    thresh = c * 1.4826 * mad(r)     # 1.4826 * MAD ~ sigma for Normal
+    # For very high-frequency data (time_period_seconds < 10), use a more conservative threshold
+    # because noise can cause false jump detections
+    if time_period_seconds < 10:
+        # For high-frequency data, increase threshold to reduce false positives
+        c_adj = c * 1.5  # More conservative for high-frequency
+    else:
+        c_adj = c
+    
+    thresh = c_adj * 1.4826 * mad(r)     # 1.4826 * MAD ~ sigma for Normal
     is_jump = np.abs(r) > max(thresh, 1e-8)
 
     r_jump = r[is_jump]
     r_diff = r[~is_jump] if (~is_jump).any() else r * 0 + 1e-8
 
     lam_per_period = is_jump.mean()     # expected jumps per time period
-    # Jump size distribution (log-multipliers)
-    if len(r_jump) >= 2:
-        mu_J = r_jump.mean()
-        delta = r_jump.std(ddof=1)
-    elif len(r_jump) == 1:
-        mu_J = r_jump.mean()
-        delta = np.std(r_diff, ddof=1)  # fallback
+    
+    # Check if we have enough diffusive returns for reliable volatility estimation
+    # If too many returns are classified as jumps, the diffusive volatility
+    # estimate becomes unreliable. In this case, use all returns for volatility
+    # and treat everything as diffusive (no jumps).
+    jump_ratio = is_jump.mean()
+    # For high-frequency data, be more lenient (need fewer diffusive returns)
+    # because noise can cause more false jump detections
+    if time_period_seconds < 10:
+        min_diffusive_ratio = 0.3  # Need at least 30% diffusive returns for high-frequency
     else:
-        mu_J, delta = 0.0, 1e-6        # no jumps observed
+        min_diffusive_ratio = 0.5  # Need at least 50% diffusive returns for lower frequency
+    
+    if jump_ratio > (1.0 - min_diffusive_ratio):
+        # Too many jumps detected - likely threshold too aggressive
+        # Use all returns for volatility, treat as pure diffusion
+        r_diff = r
+        r_jump = np.array([])
+        lam_per_period = 0.0
+        mu_J = 0.0
+        delta = 1e-6
+    else:
+        # Jump size distribution (log-multipliers)
+        if len(r_jump) >= 2:
+            mu_J = r_jump.mean()
+            delta = r_jump.std(ddof=1)
+        elif len(r_jump) == 1:
+            mu_J = r_jump.mean()
+            delta = np.std(r_diff, ddof=1) if len(r_diff) > 1 else 1e-6  # fallback
+        else:
+            mu_J, delta = 0.0, 1e-6        # no jumps observed
 
-    # Diffusive params from non-jump periods
-    sigma_dt_period = max(r_diff.std(ddof=1), 1e-8)
+    # Diffusive params from non-jump periods (or all returns if too many jumps)
+    # Ensure we have at least 2 points for std calculation
+    if len(r_diff) >= 2:
+        sigma_dt_period = max(r_diff.std(ddof=1), 1e-8)
+    else:
+        # Fallback: use all returns if we don't have enough diffusive returns
+        sigma_dt_period = max(r.std(ddof=1) if len(r) >= 2 else 1e-8, 1e-8)
     
     # Calculate per-period drift
     if drift_factor is not None and drift_factor != 1.0:

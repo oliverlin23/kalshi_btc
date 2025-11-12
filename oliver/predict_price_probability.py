@@ -11,23 +11,53 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from monte_carlo_btc import (
-    load_last_24h_prices,
-    estimate_gbm_params,
-    estimate_merton_params,
-    compute_gbm_probability_analytical,
-    compute_gbm_statistics_analytical,
-    compute_merton_probability_analytical,
-    compute_merton_statistics_analytical
-)
+try:
+    from monte_carlo_btc import (
+        load_last_24h_prices,
+        estimate_gbm_params,
+        estimate_merton_params,
+        compute_gbm_probability_analytical,
+        compute_gbm_statistics_analytical,
+        compute_merton_probability_analytical,
+        compute_merton_statistics_analytical
+    )
+except ImportError:
+    from oliver.monte_carlo_btc import (
+        load_last_24h_prices,
+        estimate_gbm_params,
+        estimate_merton_params,
+        compute_gbm_probability_analytical,
+        compute_gbm_statistics_analytical,
+        compute_merton_probability_analytical,
+        compute_merton_statistics_analytical
+    )
 
 # Import update functions
-from kaggle_update_bitcoin import (
-    download_latest_dataset,
-    download_latest_metadata,
-    check_missing_data,
-    fetch_and_append_missing_data
-)
+try:
+    from kaggle_update_bitcoin import (
+        download_latest_dataset,
+        download_latest_metadata,
+        check_missing_data,
+        fetch_and_append_missing_data
+    )
+except ImportError:
+    try:
+        from oliver.kaggle_update_bitcoin import (
+            download_latest_dataset,
+            download_latest_metadata,
+            check_missing_data,
+            fetch_and_append_missing_data
+        )
+    except ImportError:
+        # If kaggle_update_bitcoin is not available, define dummy functions
+        def download_latest_dataset():
+            return None
+        def download_latest_metadata():
+            return None
+        def check_missing_data(*args, **kwargs):
+            return False
+        def fetch_and_append_missing_data(*args, **kwargs):
+            return False
 
 # Cache for loaded data and parameter estimates
 _data_cache = {
@@ -178,20 +208,23 @@ def clear_parameter_cache():
 
 def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None, 
                              lookback_hours=24, model='merton',
-                             weight_5m=0.4, weight_15m=0.3, weight_1h=0.2, weight_6h=0.1,
+                             weight_15m=None, weight_1h=None, weight_6h=None,
+                             exponential_decay=0.5,  # Decay rate for exponential weighting (higher = faster decay)
                              verbose=False, prices_data=None, last_timestamp=None, current_price=None,
                              data_step_seconds=60, one_minute_prices_data=None, one_minute_last_timestamp=None):
     """
     Predict probability of BTC price being above target_price in hours_ahead.
     Uses analytical methods only (instant results, no Monte Carlo).
     
-    Parameters are estimated using weighted averages from multiple timeframes:
-    - Last 5 minutes (weight: configurable, default 40%)
-    - Last 15 minutes (weight: configurable, default 30%)
-    - Last 1 hour (weight: configurable, default 20%)
-    - Last 6 hours (weight: configurable, default 10%)
+    Parameters are estimated using exponential-weighted averages from multiple timeframes:
+    - Last 15 minutes (exponential weight, most recent)
+    - Last 1 hour (exponential weight)
+    - Last 6 hours (exponential weight, least recent)
     
-    More recent data is weighted more heavily to capture current market conditions.
+    Volatility and jump parameters (λ, μ_J, δ) use 15m, 1h, 6h timeframes (proper 1-minute bars).
+    The jump detection queue (per-second data) is used for real-time jump detection (spike detection), not parameter estimation.
+    
+    More recent data is weighted more heavily using exponential decay to capture current market conditions.
     
     Args:
         csv_path: Path to CSV file with BTC data (optional if prices_data provided)
@@ -199,7 +232,7 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
         hours_ahead: Hours into the future
         lookback_hours: Hours of historical data to load (default: 24, must be >= 6)
         model: Model to use ('gbm' or 'merton')
-        weight_5m: Weight for 5-minute timeframe (default: 0.4)
+        exponential_decay: Decay rate for exponential weighting (default: 0.5, higher = faster decay)
         weight_15m: Weight for 15-minute timeframe (default: 0.3)
         weight_1h: Weight for 1-hour timeframe (default: 0.2)
         weight_6h: Weight for 6-hour timeframe (default: 0.1)
@@ -208,8 +241,10 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
         last_timestamp: Optional last timestamp (required if prices_data provided)
         current_price: Optional current price (required if prices_data provided)
         data_step_seconds: Time interval between data points in seconds (default: 60 for 1-minute)
-        one_minute_prices_data: Optional array of prices from 1-minute queue (per-second updates)
-        one_minute_last_timestamp: Optional last timestamp for 1-minute queue
+        one_minute_prices_data: Optional array of prices from jump detection queue (per-second updates, max 300 seconds)
+            NOTE: This is used for real-time jump detection (spike detection), NOT for Merton parameter estimation.
+            Jump parameters (λ, μ_J, δ) are estimated from 15m/1h/6h timeframes with 1-minute bars.
+        one_minute_last_timestamp: Optional last timestamp for jump detection queue
     
     Returns:
         Dictionary with probability and statistics
@@ -240,63 +275,67 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
         print(f"Time Horizon: {hours_ahead} hours")
         print(f"Required Change: {((target_price / S0) - 1) * 100:+.2f}%")
     
+    # Calculate exponential weights if not provided
+    # Most recent (15m) gets highest weight, decays exponentially for longer timeframes
+    # Use logarithmic scaling based on actual time ratios (not just indices)
+    if weight_15m is None or weight_1h is None or weight_6h is None:
+        # Time-based exponential decay: weight = exp(-decay_rate * log(time_ratio))
+        # This ensures decay is proportional to actual time differences
+        # 15m: exp(0) = 1.0 (baseline, most recent)
+        # 1h (60m): exp(-decay * log(60/15)) = exp(-decay * log(4))
+        # 6h (360m): exp(-decay * log(360/15)) = exp(-decay * log(24))
+        weight_15m = 1.0
+        weight_1h = np.exp(-exponential_decay * np.log(60.0 / 15.0))  # 1h is 4x longer than 15m
+        weight_6h = np.exp(-exponential_decay * np.log(360.0 / 15.0))  # 6h is 24x longer than 15m
+    
     # Normalize weights to sum to 1.0
-    total_weight = weight_5m + weight_15m + weight_1h + weight_6h
+    total_weight = weight_15m + weight_1h + weight_6h
     if total_weight > 0:
-        weight_5m_norm = weight_5m / total_weight
         weight_15m_norm = weight_15m / total_weight
         weight_1h_norm = weight_1h / total_weight
         weight_6h_norm = weight_6h / total_weight
     else:
         # Fallback to equal weights if all zero
-        weight_5m_norm = weight_15m_norm = weight_1h_norm = weight_6h_norm = 1.0 / 4.0
+        weight_15m_norm = weight_1h_norm = weight_6h_norm = 1.0 / 3.0
     
     # Estimate parameters using weighted multi-timeframe approach
     if verbose:
         print(f"\n{'='*80}")
         print(f"ESTIMATING PARAMETERS (Risk-Neutral {model.upper()})")
         print(f"{'='*80}")
-        print(f"Using weighted estimates from multiple timeframes:")
+        print(f"Using exponential-weighted estimates from multiple timeframes:")
+        print(f"  - Last 15 minutes (weight: {weight_15m_norm:.2%}) - most recent")
+        print(f"  - Last 1 hour (weight: {weight_1h_norm:.2%})")
+        print(f"  - Last 6 hours (weight: {weight_6h_norm:.2%}) - least recent")
         if one_minute_prices_data is not None and len(one_minute_prices_data) >= 30:
-            print(f"  - 1-minute queue (weight: 0.50) - highest priority")
-            print(f"  - Last 5 minutes (weight: {weight_5m_norm * 0.5:.2f})")
-            print(f"  - Last 15 minutes (weight: {weight_15m_norm * 0.5:.2f})")
-            print(f"  - Last 1 hour (weight: {weight_1h_norm * 0.5:.2f})")
-            print(f"  - Last 6 hours (weight: {weight_6h_norm * 0.5:.2f})")
-        else:
-            print(f"  - Last 5 minutes (weight: {weight_5m_norm:.2f})")
-            print(f"  - Last 15 minutes (weight: {weight_15m_norm:.2f})")
-            print(f"  - Last 1 hour (weight: {weight_1h_norm:.2f})")
-            print(f"  - Last 6 hours (weight: {weight_6h_norm:.2f})")
+            print(f"  - Jump detection queue available (per-second data, max 300 seconds) - used for real-time spike detection")
+        print(f"  Exponential decay rate: {exponential_decay:.2f}")
     
     minutes_ahead = int(hours_ahead * 60)
     
-    # Extract prices for each timeframe
+    # Extract prices for each timeframe (15m, 1h, 6h only - using proper 1-minute bars)
     last_timestamp = last_ts
-    prices_5m = extract_prices_for_window(prices, last_timestamp, minutes=5, data_step_seconds=data_step_seconds)
     prices_15m = extract_prices_for_window(prices, last_timestamp, minutes=15, data_step_seconds=data_step_seconds)
     prices_1h = extract_prices_for_window(prices, last_timestamp, minutes=60, data_step_seconds=data_step_seconds)
     prices_6h = extract_prices_for_window(prices, last_timestamp, minutes=360, data_step_seconds=data_step_seconds)
     
     if verbose:
         print(f"\nData points per timeframe:")
+        print(f"  Last 15 minutes: {len(prices_15m)} points (1-minute bars) - used for volatility & jump parameters")
+        print(f"  Last 1 hour:     {len(prices_1h)} points (1-minute bars) - used for volatility & jump parameters")
+        print(f"  Last 6 hours:    {len(prices_6h)} points (1-minute bars) - used for volatility & jump parameters")
         if one_minute_prices_data is not None:
-            print(f"  1-minute queue:  {len(one_minute_prices_data)} points (per-second)")
-        print(f"  Last 5 minutes:  {len(prices_5m)} points")
-        print(f"  Last 15 minutes: {len(prices_15m)} points")
-        print(f"  Last 1 hour:     {len(prices_1h)} points")
-        print(f"  Last 6 hours:    {len(prices_6h)} points")
+            print(f"  Jump detection queue:  {len(one_minute_prices_data)} points (per-second, max 300) - used for real-time spike detection only")
         print(f"\n{'='*80}")
         print("USING ANALYTICAL METHOD (Instant Results)")
         print(f"{'='*80}")
     
     # Create cache key for parameter estimates
     # Use last timestamp as part of key - when queue updates, timestamp changes, so we recalculate
-    # This ensures we cache parameters between queue updates (every 5 seconds) but recalculate
+    # This ensures we cache parameters between queue updates (every DATA_STEP_SECONDS) but recalculate
     # when new data arrives, which is exactly what we want
-    # Include 1-minute queue timestamp if available
-    one_min_ts_key = one_minute_last_timestamp if one_minute_prices_data is not None and len(one_minute_prices_data) >= 30 else None
-    cache_key = (model, weight_5m_norm, weight_15m_norm, weight_1h_norm, weight_6h_norm, last_timestamp, one_min_ts_key)
+    # Note: jump detection queue timestamp is NOT included since it's not used for parameter estimation
+    cache_key = (model, weight_15m_norm, weight_1h_norm, weight_6h_norm, exponential_decay, last_timestamp)
     
     # Check parameter cache
     if cache_key in _data_cache['params_cache']:
@@ -306,15 +345,14 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
     else:
         # Estimate parameters (not cached)
         if model == 'gbm':
-            # Estimate GBM parameters from each timeframe
-            params_5m = estimate_gbm_params(prices_5m, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_5m) >= 5 else None
+            # Estimate GBM parameters from each timeframe (15m, 1h, 6h only)
             params_15m = estimate_gbm_params(prices_15m, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_15m) >= 10 else None
             params_1h = estimate_gbm_params(prices_1h, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_1h) >= 30 else None
             params_6h = estimate_gbm_params(prices_6h, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_6h) >= 100 else None
             
-            # Weight and combine (more recent = higher weight)
-            weights = [weight_5m_norm, weight_15m_norm, weight_1h_norm, weight_6h_norm]  # 5m, 15m, 1h, 6h
-            params_list = [params_5m, params_15m, params_1h, params_6h]
+            # Weight and combine with exponential scaling (more recent = higher weight)
+            weights = [weight_15m_norm, weight_1h_norm, weight_6h_norm]  # 15m, 1h, 6h
+            params_list = [params_15m, params_1h, params_6h]
             
             # Filter out None values and normalize weights
             valid_params = [(p, w) for p, w in zip(params_list, weights) if p is not None]
@@ -335,8 +373,8 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
                 print(f"\nWeighted Parameters (per minute):")
                 print(f"  Drift (μ):     {mu_dt:.8f} (risk-neutral = 0)")
                 print(f"  Volatility (σ): {sigma_dt:.8f}")
-                print(f"\nContributions:")
-                timeframe_names = ["5m", "15m", "1h", "6h"]
+                print(f"\nContributions (exponential weighting):")
+                timeframe_names = ["15m", "1h", "6h"]
                 for p, w in normalized_params:
                     idx = params_list.index(p)
                     timeframe = timeframe_names[idx]
@@ -346,57 +384,46 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
             _data_cache['params_cache'][cache_key] = model_params
             
         elif model == 'merton':
-            # Estimate Merton parameters from each timeframe
-            params_5m = estimate_merton_params(prices_5m, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_5m) >= 5 else None
+            # Estimate Merton parameters from each timeframe (using proper 1-minute bars)
+            # Only use 15m, 1h, 6h for volatility estimation (5m removed due to small sample size)
             params_15m = estimate_merton_params(prices_15m, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_15m) >= 10 else None
             params_1h = estimate_merton_params(prices_1h, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_1h) >= 30 else None
             params_6h = estimate_merton_params(prices_6h, risk_neutral=True, drift_factor=0.0, time_period_seconds=data_step_seconds) if len(prices_6h) >= 100 else None
             
-            # Estimate from 1-minute queue if available (per-second data)
-            params_1min = None
-            weight_1min_norm = 0.0
-            if one_minute_prices_data is not None and len(one_minute_prices_data) >= 30:
-                # 1-minute queue has per-second data, so time_period_seconds=1
-                params_1min = estimate_merton_params(one_minute_prices_data, risk_neutral=True, drift_factor=0.0, time_period_seconds=1)
-                # Give 1-minute queue highest weight (50% of total), redistribute others proportionally
-                weight_1min_raw = 0.5
-                remaining_weight = 1.0 - weight_1min_raw
-                # Redistribute existing weights proportionally
-                weight_5m_norm_adj = weight_5m_norm * remaining_weight
-                weight_15m_norm_adj = weight_15m_norm * remaining_weight
-                weight_1h_norm_adj = weight_1h_norm * remaining_weight
-                weight_6h_norm_adj = weight_6h_norm * remaining_weight
-                weight_1min_norm = weight_1min_raw
-            else:
-                # No 1-minute queue data, use original weights
-                weight_5m_norm_adj = weight_5m_norm
-                weight_15m_norm_adj = weight_15m_norm
-                weight_1h_norm_adj = weight_1h_norm
-                weight_6h_norm_adj = weight_6h_norm
+            # VOLATILITY: Use only 15m, 1h, 6h (proper 1-minute bars) with exponential weighting
+            # Per-second data causes volatility underestimation due to microstructure noise
+            vol_weights = [weight_15m_norm, weight_1h_norm, weight_6h_norm]
+            vol_params_list = [params_15m, params_1h, params_6h]
             
-            # Weight and combine (more recent = higher weight)
-            if params_1min is not None:
-                weights = [weight_1min_norm, weight_5m_norm_adj, weight_15m_norm_adj, weight_1h_norm_adj, weight_6h_norm_adj]  # 1min, 5m, 15m, 1h, 6h
-                params_list = [params_1min, params_5m, params_15m, params_1h, params_6h]
-            else:
-                weights = [weight_5m_norm, weight_15m_norm, weight_1h_norm, weight_6h_norm]  # 5m, 15m, 1h, 6h
-                params_list = [params_5m, params_15m, params_1h, params_6h]
+            valid_vol_params = [(p, w) for p, w in zip(vol_params_list, vol_weights) if p is not None]
+            if not valid_vol_params:
+                raise ValueError("Insufficient data for volatility estimation")
             
-            # Filter out None values and normalize weights
-            valid_params = [(p, w) for p, w in zip(params_list, weights) if p is not None]
-            if not valid_params:
-                raise ValueError("Insufficient data for parameter estimation")
+            total_vol_weight = sum(w for _, w in valid_vol_params)
+            normalized_vol_params = [(p, w / total_vol_weight) for p, w in valid_vol_params]
             
-            # Normalize weights (in case some timeframes had insufficient data)
-            total_weight = sum(w for _, w in valid_params)
-            normalized_params = [(p, w / total_weight) for p, w in valid_params]
+            # Weighted average for volatility (from 1-minute bars only, exponential weighting)
+            mu_dt = sum(p['mu_dt'] * w for p, w in normalized_vol_params)
+            sigma_dt = sum(p['sigma_dt'] * w for p, w in normalized_vol_params)
             
-            # Weighted average for each parameter
-            mu_dt = sum(p['mu_dt'] * w for p, w in normalized_params)
-            sigma_dt = sum(p['sigma_dt'] * w for p, w in normalized_params)
-            lam = sum(p['lam'] * w for p, w in normalized_params)
-            mu_J = sum(p['mu_J'] * w for p, w in normalized_params)
-            delta = sum(p['delta'] * w for p, w in normalized_params)
+            # JUMP PARAMETERS: Use same weighted approach as volatility (15m, 1h, 6h with 1-minute bars)
+            # Jump parameters (λ, μ_J, δ) are statistical properties that need sufficient data
+            # Using 1-minute bars provides better estimates than per-second data which has microstructure noise
+            # The jump detection queue is used for real-time jump detection (spike detection), not parameter estimation
+            jump_weights = [weight_15m_norm, weight_1h_norm, weight_6h_norm]
+            jump_params_list = [params_15m, params_1h, params_6h]
+            
+            valid_jump_params = [(p, w) for p, w in zip(jump_params_list, jump_weights) if p is not None]
+            if not valid_jump_params:
+                raise ValueError("Insufficient data for jump parameter estimation")
+            
+            total_jump_weight = sum(w for _, w in valid_jump_params)
+            normalized_jump_params = [(p, w / total_jump_weight) for p, w in valid_jump_params]
+            
+            # Weighted average for jump parameters (from 1-minute bars only, exponential weighting)
+            lam = sum(p['lam'] * w for p, w in normalized_jump_params)
+            mu_J = sum(p['mu_J'] * w for p, w in normalized_jump_params)
+            delta = sum(p['delta'] * w for p, w in normalized_jump_params)
             
             model_params = {
                 'mu_dt': mu_dt,
@@ -413,15 +440,19 @@ def predict_price_probability(csv_path=None, target_price=None, hours_ahead=None
                 print(f"  Jump intensity (λ): {lam:.6f} per minute")
                 print(f"  Jump mean (μ_J):    {mu_J:.8f}")
                 print(f"  Jump std (δ):       {delta:.8f}")
-                print(f"\nContributions:")
-                if params_1min is not None:
-                    timeframe_names = ["1min", "5m", "15m", "1h", "6h"]
-                else:
-                    timeframe_names = ["5m", "15m", "1h", "6h"]
-                for p, w in normalized_params:
-                    idx = params_list.index(p)
-                    timeframe = timeframe_names[idx]
-                    print(f"  {timeframe}: σ={p['sigma_dt']:.8f}, λ={p['lam']:.6f} (weight: {w:.2%})")
+                print(f"\nVolatility Contributions (exponential weighting, 1-minute bars):")
+                vol_timeframe_names = ["15m", "1h", "6h"]
+                for p, w in normalized_vol_params:
+                    idx = vol_params_list.index(p)
+                    timeframe = vol_timeframe_names[idx]
+                    print(f"  {timeframe}: σ={p['sigma_dt']:.8f} (weight: {w:.2%})")
+                print(f"\nJump Parameters (weighted from 15m/1h/6h timeframes - 1-minute bars):")
+                jump_timeframe_names = ["15m", "1h", "6h"]
+                for p, w in normalized_jump_params:
+                    idx = jump_params_list.index(p)
+                    timeframe = jump_timeframe_names[idx]
+                    print(f"  {timeframe}: λ={p['lam']:.6f}, μ_J={p['mu_J']:.8f}, δ={p['delta']:.8f} (weight: {w:.2%})")
+                print(f"  Weighted average: λ={lam:.6f}, μ_J={mu_J:.8f}, δ={delta:.8f}")
             
             # Cache parameters
             _data_cache['params_cache'][cache_key] = model_params
@@ -556,28 +587,28 @@ Examples:
         help='Skip dataset update and use existing CSV file'
     )
     parser.add_argument(
-        '--weight-5m',
-        type=float,
-        default=0.4,
-        help='Weight for 5-minute timeframe (default: 0.4)'
-    )
-    parser.add_argument(
         '--weight-15m',
         type=float,
-        default=0.3,
-        help='Weight for 15-minute timeframe (default: 0.3)'
+        default=None,
+        help='Weight for 15-minute timeframe (default: None, uses exponential decay)'
     )
     parser.add_argument(
         '--weight-1h',
         type=float,
-        default=0.2,
-        help='Weight for 1-hour timeframe (default: 0.2)'
+        default=None,
+        help='Weight for 1-hour timeframe (default: None, uses exponential decay)'
     )
     parser.add_argument(
         '--weight-6h',
         type=float,
-        default=0.1,
-        help='Weight for 6-hour timeframe (default: 0.1)'
+        default=None,
+        help='Weight for 6-hour timeframe (default: None, uses exponential decay)'
+    )
+    parser.add_argument(
+        '--exponential-decay',
+        type=float,
+        default=0.5,
+        help='Exponential decay rate for weighting (higher = faster decay, default: 0.5)'
     )
     
     args = parser.parse_args()
@@ -599,10 +630,10 @@ Examples:
         args.hours,
         lookback_hours=args.lookback,
         model=args.model,
-        weight_5m=args.weight_5m,
         weight_15m=args.weight_15m,
         weight_1h=args.weight_1h,
         weight_6h=args.weight_6h,
+        exponential_decay=args.exponential_decay,
         verbose=True
     )
     
