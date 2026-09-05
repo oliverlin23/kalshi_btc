@@ -1,2 +1,0 @@
-"""Kalshi Bitcoin trading utilities."""
-
